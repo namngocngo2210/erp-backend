@@ -1,0 +1,1323 @@
+openapi: 3.0.3
+info:
+  title: CRM Daily Report API
+  version: 2.0.0
+  description: 'API chỉ đọc cho trợ lý báo cáo ngày. Xác thực bằng header X-Api-Token.
+    Từ 16/09/2026 mọi endpoint trả TỪNG DÒNG (đơn, dòng hàng, lead mở, chi tiêu ads)
+    với phân trang keyset `cursor`/`limit`, không còn số gộp và không còn `group_by`
+    — bên gọi tự đếm/cộng theo `bucket`. Ngày theo múi giờ Asia/Ho_Chi_Minh; tiền
+    là số nguyên VND; mọi response có meta.data_as_of là mốc dữ liệu (mart cập nhật
+    mỗi 30 phút). Cách tính lại từng chỉ số cũ: GET /definitions → metrics.'
+paths:
+  /ads:
+    get:
+      operationId: ads_retrieve
+      description: 'Σ `spend_adjusted` mọi dòng theo (platform, account_id) = chi
+        tiêu TKQC (bản sao gộp Max). Dòng `is_remainder` = TKQC − Σ chiến dịch, có
+        thể âm khi sync lệch nhịp — nêu ra, đừng cộng vào chiến dịch. Muốn theo Digital:
+        nối `channels` với `channel` bên /orders/stats. Không có ad set / ad riêng
+        lẻ. Dòng chiến dịch Facebook mang `leads`/`closed`/`orders`/`revenue` quy
+        theo `fb_campaign_id` của lead (ngày TẠO); chiến dịch có đơn mà không tiêu
+        trong ngày vẫn có dòng spend 0. Độ phủ quy về chiến dịch ở `meta.attribution`.
+        Mốc sync mỗi nền tảng ở `meta.spend_as_of`.'
+      summary: 'Từng dòng chi tiêu quảng cáo: ngày × nền tảng × TKQC × chiến dịch
+        (+ lead/đơn/doanh thu quy về chiến dịch), kèm dòng dư mỗi TKQC'
+      parameters:
+      - in: query
+        name: cursor
+        schema:
+          type: string
+        description: Giá trị `next_cursor` của trang trước (keyset). Bỏ trống để lấy
+          trang đầu.
+      - in: query
+        name: from
+        schema:
+          type: string
+        description: YYYY-MM-DD giờ VN, mặc định hôm qua, bao gồm
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Số dòng mỗi trang, mặc định 200. Vượt trần bị kẹp về trần, không
+          lỗi.
+      - in: query
+        name: to
+        schema:
+          type: string
+        description: YYYY-MM-DD giờ VN, mặc định hôm qua, bao gồm; tối đa 92 ngày
+      tags:
+      - daily-report
+      security:
+      - ApiKeyAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdSpendRowsPage'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Tham số sai — detail nói rõ trường nào
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Thiếu/sai X-Api-Token
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Prod chưa cấu hình token, hoặc DB/mart lỗi
+  /definitions:
+    get:
+      operationId: definitions_retrieve
+      summary: Từ điển trạng thái + định nghĩa chỉ số
+      tags:
+      - daily-report
+      security:
+      - ApiKeyAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefinitionsEnvelope'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Tham số sai — detail nói rõ trường nào
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Thiếu/sai X-Api-Token
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Prod chưa cấu hình token, hoặc DB/mart lỗi
+  /health:
+    get:
+      operationId: health_retrieve
+      summary: 'Health: DB, Redis, độ tươi mart'
+      tags:
+      - daily-report
+      security:
+      - ApiKeyAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+          description: ''
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+          description: ''
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Thiếu/sai X-Api-Token
+  /leads/stats:
+    get:
+      operationId: leads_stats_retrieve
+      description: Mỗi dòng = 1 đơn. Đếm theo `sales_status.bucket` để ra các rổ lead;
+        `bucket` null = chưa đánh giá.
+      summary: Từng lead (đơn nội bộ tạo trong kỳ, mọi trạng thái)
+      parameters:
+      - in: query
+        name: cursor
+        schema:
+          type: string
+        description: Giá trị `next_cursor` của trang trước (keyset). Bỏ trống để lấy
+          trang đầu.
+      - in: query
+        name: from
+        schema:
+          type: string
+        description: YYYY-MM-DD giờ VN, mặc định hôm qua, bao gồm
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Số dòng mỗi trang, mặc định 200. Vượt trần bị kẹp về trần, không
+          lỗi.
+      - in: query
+        name: to
+        schema:
+          type: string
+        description: YYYY-MM-DD giờ VN, mặc định hôm qua, bao gồm; tối đa 92 ngày
+      tags:
+      - daily-report
+      security:
+      - ApiKeyAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeadRowsPage'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Tham số sai — detail nói rõ trường nào
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Thiếu/sai X-Api-Token
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Prod chưa cấu hình token, hoặc DB/mart lỗi
+  /orders/stats:
+    get:
+      operationId: orders_stats_retrieve
+      description: Mỗi dòng = 1 đơn đã lên hoá đơn, không huỷ, loại chi nhánh ẩn.
+        Đếm theo `order_status.bucket` để ra delivered/awaiting/returned/return_risk;
+        Σ `amounts.total` = total_revenue.
+      summary: Từng đơn có hoá đơn (tập total_orders của Báo cáo tổng)
+      parameters:
+      - in: query
+        name: cursor
+        schema:
+          type: string
+        description: Giá trị `next_cursor` của trang trước (keyset). Bỏ trống để lấy
+          trang đầu.
+      - in: query
+        name: from
+        schema:
+          type: string
+        description: YYYY-MM-DD giờ VN, mặc định hôm qua, bao gồm
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Số dòng mỗi trang, mặc định 200. Vượt trần bị kẹp về trần, không
+          lỗi.
+      - in: query
+        name: to
+        schema:
+          type: string
+        description: YYYY-MM-DD giờ VN, mặc định hôm qua, bao gồm; tối đa 92 ngày
+      tags:
+      - daily-report
+      security:
+      - ApiKeyAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderRowsPage'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Tham số sai — detail nói rõ trường nào
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Thiếu/sai X-Api-Token
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Prod chưa cấu hình token, hoặc DB/mart lỗi
+  /pipeline:
+    get:
+      operationId: pipeline_retrieve
+      description: 'Lead tạo trong lookback_days ngày, chưa lên hoá đơn, chưa huỷ,
+        trạng thái sale chưa kết thúc. `age_days` = as_of − ngày tạo; rổ tuổi cũ:
+        0-1d / 2-3d / 4-7d / 8d+.'
+      summary: Từng lead còn mở tính đến as_of
+      parameters:
+      - in: query
+        name: as_of
+        schema:
+          type: string
+        description: YYYY-MM-DD, mặc định hôm nay giờ VN
+      - in: query
+        name: cursor
+        schema:
+          type: string
+        description: Giá trị `next_cursor` của trang trước (keyset). Bỏ trống để lấy
+          trang đầu.
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Số dòng mỗi trang, mặc định 200. Vượt trần bị kẹp về trần, không
+          lỗi.
+      - in: query
+        name: lookback_days
+        schema:
+          type: integer
+        description: 1..92, mặc định 30
+      tags:
+      - daily-report
+      security:
+      - ApiKeyAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenLeadRowsPage'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Tham số sai — detail nói rõ trường nào
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Thiếu/sai X-Api-Token
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Prod chưa cấu hình token, hoặc DB/mart lỗi
+  /revenue:
+    get:
+      operationId: revenue_retrieve
+      description: Cùng bộ lọc với /orders/stats; nối `order_id`. Σ `amount` theo
+        đơn có thể khác `amounts.total` bên /orders/stats vì phí ship/giảm giá cấp
+        đơn.
+      summary: Từng dòng hàng (sản phẩm trong đơn) của tập đơn có hoá đơn
+      parameters:
+      - in: query
+        name: cursor
+        schema:
+          type: string
+        description: Giá trị `next_cursor` của trang trước (keyset). Bỏ trống để lấy
+          trang đầu.
+      - in: query
+        name: from
+        schema:
+          type: string
+        description: YYYY-MM-DD giờ VN, mặc định hôm qua, bao gồm
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Số dòng mỗi trang, mặc định 200. Vượt trần bị kẹp về trần, không
+          lỗi.
+      - in: query
+        name: to
+        schema:
+          type: string
+        description: YYYY-MM-DD giờ VN, mặc định hôm qua, bao gồm; tối đa 92 ngày
+      tags:
+      - daily-report
+      security:
+      - ApiKeyAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderLineRowsPage'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Tham số sai — detail nói rõ trường nào
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Thiếu/sai X-Api-Token
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Prod chưa cấu hình token, hoặc DB/mart lỗi
+  /summary:
+    get:
+      operationId: summary_retrieve
+      description: 'Endpoint đã bỏ (16/09/2026): API trả từng dòng, không còn gói
+        số gộp. Ghép từ /leads/stats, /orders/stats, /pipeline.'
+      summary: '[Đã bỏ] Gói báo cáo ngày — luôn 410'
+      tags:
+      - daily-report
+      security:
+      - ApiKeyAuth: []
+      responses:
+        '410':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: 'Endpoint đã bỏ (16/09/2026): API trả từng dòng, không còn
+            gói số gộp. Ghép từ /leads/stats, /orders/stats, /pipeline.'
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Thiếu/sai X-Api-Token
+components:
+  schemas:
+    AdSpendRow:
+      type: object
+      properties:
+        day:
+          type: string
+          format: date
+        platform:
+          $ref: '#/components/schemas/PlatformEnum'
+        account_id:
+          type: string
+          description: Id TKQC bên nền tảng
+        account_name:
+          type: string
+        channels:
+          type: array
+          items:
+            type: string
+          description: Mã kênh (Digital) TKQC được gắn; rỗng = chưa map
+        campaign_id:
+          type: string
+          nullable: true
+          description: null = dòng dư của TKQC (is_remainder)
+        campaign_name:
+          type: string
+          nullable: true
+        sku:
+          type: string
+          nullable: true
+          description: SKU đã gán cho chiến dịch; null = chưa gán
+        is_remainder:
+          type: boolean
+          description: true = chi tiêu TKQC − Σ chiến dịch trong ngày; có thể âm
+        spend:
+          type: integer
+          description: VND, CHƯA nhân hệ số
+        multiplier:
+          type: number
+          format: double
+          description: Hệ số VAT/phụ phí chọn theo `from` của kỳ (xem /definitions.cost_multiplier)
+        spend_adjusted:
+          type: integer
+          description: round(spend × multiplier)
+        impressions:
+          type: integer
+        clicks:
+          type: integer
+        leads:
+          type: integer
+          nullable: true
+          description: Lead TẠO trong `day` có fb_campaign_id = campaign_id (cùng
+            tập /leads/stats); null ở dòng dư
+        closed:
+          type: integer
+          nullable: true
+          description: Trong `leads`, sales_status.bucket = closed
+        orders:
+          type: integer
+          nullable: true
+          description: Đơn có hoá đơn tạo trong `day` quy về campaign (cùng tập /orders/stats)
+        revenue:
+          type: integer
+          nullable: true
+          description: VND, Σ amounts.total của `orders` (luật total_revenue)
+        cursor:
+          type: string
+          description: '`day|platform|account_id|campaign_id`; account_id rỗng = chiến
+            dịch chưa sync danh mục'
+      required:
+      - account_id
+      - account_name
+      - campaign_id
+      - campaign_name
+      - channels
+      - clicks
+      - closed
+      - cursor
+      - day
+      - impressions
+      - is_remainder
+      - leads
+      - multiplier
+      - orders
+      - platform
+      - revenue
+      - sku
+      - spend
+      - spend_adjusted
+    AdSpendRowsPage:
+      type: object
+      properties:
+        meta:
+          $ref: '#/components/schemas/Meta'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdSpendRow'
+        limit:
+          type: integer
+        next_cursor:
+          type: string
+          nullable: true
+          description: null = hết
+      required:
+      - data
+      - limit
+      - meta
+      - next_cursor
+    Age:
+      type: object
+      properties:
+        label:
+          type: string
+          nullable: true
+        source:
+          type: string
+          nullable: true
+      required:
+      - label
+      - source
+    Amounts:
+      type: object
+      properties:
+        goods:
+          type: integer
+          nullable: true
+          description: VND, tiền hàng
+        discount:
+          type: integer
+          nullable: true
+        shipping:
+          type: integer
+          nullable: true
+        total:
+          type: integer
+          nullable: true
+          description: VND, tổng sau giảm — cột doanh thu
+        quantity:
+          type: integer
+          nullable: true
+      required:
+      - discount
+      - goods
+      - quantity
+      - shipping
+      - total
+    Calls:
+      type: object
+      properties:
+        count:
+          type: integer
+          nullable: true
+        seconds:
+          type: integer
+          nullable: true
+        has_transcript:
+          type: boolean
+          nullable: true
+        ai_extracted:
+          type: boolean
+          nullable: true
+        quality_score:
+          type: number
+          format: double
+          nullable: true
+      required:
+      - ai_extracted
+      - count
+      - has_transcript
+      - quality_score
+      - seconds
+    Channel:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+          nullable: true
+        type:
+          type: string
+          nullable: true
+          description: Loại kênh (Facebook, Google…)
+      required:
+      - id
+      - name
+      - type
+    CodeLabel:
+      type: object
+      properties:
+        code:
+          type: string
+          nullable: true
+        label:
+          type: string
+          nullable: true
+      required:
+      - code
+      - label
+    Customer:
+      type: object
+      properties:
+        id:
+          type: integer
+          nullable: true
+        code:
+          type: string
+          nullable: true
+        name:
+          type: string
+          nullable: true
+        phone_masked:
+          type: string
+          nullable: true
+          description: SĐT đã che, vd 0912***678
+        province:
+          type: string
+          nullable: true
+        district:
+          type: string
+          nullable: true
+        is_new:
+          type: boolean
+          nullable: true
+      required:
+      - code
+      - district
+      - id
+      - is_new
+      - name
+      - phone_masked
+      - province
+    Definitions:
+      type: object
+      properties:
+        order_status:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        invoice_status:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        sales_status:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        order_source:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeLabel'
+        channel_group:
+          type: array
+          items:
+            type: string
+        order_buckets:
+          type: object
+          additionalProperties:
+            type: string
+        lead_buckets:
+          type: array
+          items:
+            type: string
+        excluded_branches:
+          type: array
+          items:
+            type: string
+        metrics:
+          type: object
+          additionalProperties:
+            type: string
+        ad_account_channels:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+          description: Bản đồ TKQC → mã kênh (Digital)
+        cost_multiplier:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: {}
+          description: Luật hệ số VAT/phụ phí theo nền tảng
+      required:
+      - ad_account_channels
+      - channel_group
+      - cost_multiplier
+      - excluded_branches
+      - invoice_status
+      - lead_buckets
+      - metrics
+      - order_buckets
+      - order_source
+      - order_status
+      - sales_status
+    DefinitionsEnvelope:
+      type: object
+      properties:
+        meta:
+          $ref: '#/components/schemas/Meta'
+        data:
+          $ref: '#/components/schemas/Definitions'
+      required:
+      - data
+      - meta
+    Error:
+      type: object
+      properties:
+        detail:
+          type: string
+      required:
+      - detail
+    Health:
+      type: object
+      properties:
+        status:
+          $ref: '#/components/schemas/StatusEnum'
+        checks:
+          $ref: '#/components/schemas/HealthChecks'
+      required:
+      - checks
+      - status
+    HealthChecks:
+      type: object
+      properties:
+        db:
+          type: boolean
+        redis:
+          type: boolean
+        mart:
+          $ref: '#/components/schemas/MartCheck'
+      required:
+      - db
+      - mart
+      - redis
+    IntCodeLabel:
+      type: object
+      properties:
+        code:
+          type: integer
+          nullable: true
+        label:
+          type: string
+          nullable: true
+      required:
+      - code
+      - label
+    Items:
+      type: object
+      properties:
+        line_count:
+          type: integer
+          nullable: true
+        skus:
+          type: array
+          items:
+            type: string
+        skus_label:
+          type: string
+          nullable: true
+        main_sku:
+          type: string
+          nullable: true
+      required:
+      - line_count
+      - main_sku
+      - skus
+      - skus_label
+    LeadRowsPage:
+      type: object
+      properties:
+        meta:
+          $ref: '#/components/schemas/Meta'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderRow'
+        limit:
+          type: integer
+        next_cursor:
+          type: integer
+          nullable: true
+          description: null = hết
+      required:
+      - data
+      - limit
+      - meta
+      - next_cursor
+    MartCheck:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        data_as_of:
+          type: string
+          format: date-time
+          nullable: true
+        lag_minutes:
+          type: integer
+          nullable: true
+        status:
+          type: string
+      required:
+      - data_as_of
+      - lag_minutes
+      - ok
+      - status
+    Meta:
+      type: object
+      properties:
+        timezone:
+          type: string
+        range:
+          type: object
+          additionalProperties:
+            type: string
+            format: date
+        data_as_of:
+          type: string
+          format: date-time
+          nullable: true
+          description: Mốc dữ liệu mart, giờ VN
+        data_status:
+          type: string
+        definitions_url:
+          type: string
+        generated_at:
+          type: string
+          format: date-time
+        spend_as_of:
+          type: object
+          additionalProperties:
+            type: string
+            format: date-time
+            nullable: true
+          description: 'Chỉ /ads: mốc sync chi tiêu mỗi nền tảng'
+        attribution:
+          type: object
+          additionalProperties:
+            type: integer
+          description: 'Chỉ /ads: độ phủ quy đơn về chiến dịch trong kỳ — leads, leads_with_campaign,
+            landing_leads, landing_leads_with_campaign'
+      required:
+      - data_as_of
+      - data_status
+      - definitions_url
+      - generated_at
+      - range
+      - timezone
+    Needs:
+      type: object
+      properties:
+        codes:
+          type: array
+          items:
+            type: string
+        label:
+          type: string
+          nullable: true
+      required:
+      - codes
+      - label
+    NullEnum:
+      enum:
+      - null
+    OpenLeadRow:
+      type: object
+      properties:
+        id:
+          type: integer
+        code:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_date:
+          type: string
+          format: date
+          nullable: true
+        source:
+          $ref: '#/components/schemas/CodeLabel'
+        channel:
+          allOf:
+          - $ref: '#/components/schemas/Channel'
+          nullable: true
+        channel_group:
+          type: string
+          nullable: true
+        fb_campaign_id:
+          type: string
+          nullable: true
+          description: ID chiến dịch Facebook (utm_id trên URL landing) — nối `campaign_id`
+            bên /ads; null = không nối được
+        fb_ad_id:
+          type: string
+          nullable: true
+          description: ID quảng cáo Facebook (utm_content); chỉ để tra cứu, /ads không
+            có grain ad
+        staff:
+          allOf:
+          - $ref: '#/components/schemas/StaffRef'
+          nullable: true
+        customer:
+          $ref: '#/components/schemas/Customer'
+        amounts:
+          $ref: '#/components/schemas/Amounts'
+        items:
+          $ref: '#/components/schemas/Items'
+        sales_status:
+          $ref: '#/components/schemas/SalesStatus'
+        calls:
+          $ref: '#/components/schemas/Calls'
+        synced_at:
+          type: string
+          format: date-time
+          nullable: true
+        age_days:
+          type: integer
+          description: as_of − created_date
+        cursor:
+          type: integer
+      required:
+      - age_days
+      - amounts
+      - calls
+      - channel
+      - channel_group
+      - code
+      - created_at
+      - created_date
+      - cursor
+      - customer
+      - fb_ad_id
+      - fb_campaign_id
+      - id
+      - items
+      - sales_status
+      - source
+      - staff
+      - synced_at
+    OpenLeadRowsPage:
+      type: object
+      properties:
+        meta:
+          $ref: '#/components/schemas/Meta'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenLeadRow'
+        limit:
+          type: integer
+        next_cursor:
+          type: integer
+          nullable: true
+          description: null = hết
+      required:
+      - data
+      - limit
+      - meta
+      - next_cursor
+    OrderLineRow:
+      type: object
+      properties:
+        line_id:
+          type: integer
+        order_id:
+          type: integer
+          description: Nối với `id` bên /orders/stats
+        order_code:
+          type: string
+          nullable: true
+        created_date:
+          type: string
+          format: date
+          nullable: true
+        sku:
+          type: string
+          nullable: true
+        product_name:
+          type: string
+          nullable: true
+        product_group:
+          type: string
+          nullable: true
+        quantity:
+          type: integer
+          nullable: true
+        unit_price:
+          type: integer
+          nullable: true
+        amount:
+          type: integer
+          nullable: true
+          description: VND, thành tiền dòng
+        cursor:
+          type: integer
+      required:
+      - amount
+      - created_date
+      - cursor
+      - line_id
+      - order_code
+      - order_id
+      - product_group
+      - product_name
+      - quantity
+      - sku
+      - unit_price
+    OrderLineRowsPage:
+      type: object
+      properties:
+        meta:
+          $ref: '#/components/schemas/Meta'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderLineRow'
+        limit:
+          type: integer
+        next_cursor:
+          type: integer
+          nullable: true
+          description: null = hết
+      required:
+      - data
+      - limit
+      - meta
+      - next_cursor
+    OrderRow:
+      type: object
+      properties:
+        id:
+          type: integer
+        code:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_date:
+          type: string
+          format: date
+          nullable: true
+        closed_at:
+          type: string
+          format: date-time
+          nullable: true
+        closed_date:
+          type: string
+          format: date
+          nullable: true
+        order_status:
+          $ref: '#/components/schemas/OrderStatus'
+        invoice_status:
+          $ref: '#/components/schemas/IntCodeLabel'
+        is_valid_revenue:
+          type: boolean
+          description: la_don_gtc — cờ duy nhất hợp lệ để tính doanh thu
+        order_type:
+          $ref: '#/components/schemas/CodeLabel'
+        koc_type:
+          $ref: '#/components/schemas/CodeLabel'
+        source:
+          $ref: '#/components/schemas/CodeLabel'
+        delivery_method:
+          $ref: '#/components/schemas/CodeLabel'
+        payment_method:
+          type: string
+          nullable: true
+        channel:
+          allOf:
+          - $ref: '#/components/schemas/Channel'
+          nullable: true
+          description: Kênh = Digital, không phải fanpage
+        channel_group:
+          type: string
+          nullable: true
+        fb_campaign_id:
+          type: string
+          nullable: true
+          description: ID chiến dịch Facebook (utm_id trên URL landing) — nối `campaign_id`
+            bên /ads; null = không nối được
+        fb_ad_id:
+          type: string
+          nullable: true
+          description: ID quảng cáo Facebook (utm_content); chỉ để tra cứu, /ads không
+            có grain ad
+        branch_id:
+          type: string
+          nullable: true
+        staff:
+          allOf:
+          - $ref: '#/components/schemas/StaffRef'
+          nullable: true
+        customer:
+          $ref: '#/components/schemas/Customer'
+        amounts:
+          $ref: '#/components/schemas/Amounts'
+        items:
+          $ref: '#/components/schemas/Items'
+        sales_status:
+          $ref: '#/components/schemas/SalesStatus'
+        reason_not_closed:
+          $ref: '#/components/schemas/CodeLabel'
+        delivery_business_status:
+          $ref: '#/components/schemas/CodeLabel'
+        bounce_reason_group:
+          $ref: '#/components/schemas/CodeLabel'
+        customer_class:
+          $ref: '#/components/schemas/CodeLabel'
+        needs:
+          $ref: '#/components/schemas/Needs'
+        age:
+          $ref: '#/components/schemas/Age'
+        occupation:
+          $ref: '#/components/schemas/CodeLabel'
+        pain_level:
+          $ref: '#/components/schemas/CodeLabel'
+        calls:
+          $ref: '#/components/schemas/Calls'
+        synced_at:
+          type: string
+          format: date-time
+          nullable: true
+        cursor:
+          type: integer
+      required:
+      - age
+      - amounts
+      - bounce_reason_group
+      - branch_id
+      - calls
+      - channel
+      - channel_group
+      - closed_at
+      - closed_date
+      - code
+      - created_at
+      - created_date
+      - cursor
+      - customer
+      - customer_class
+      - delivery_business_status
+      - delivery_method
+      - fb_ad_id
+      - fb_campaign_id
+      - id
+      - invoice_status
+      - is_valid_revenue
+      - items
+      - koc_type
+      - needs
+      - occupation
+      - order_status
+      - order_type
+      - pain_level
+      - payment_method
+      - reason_not_closed
+      - sales_status
+      - source
+      - staff
+      - synced_at
+    OrderRowsPage:
+      type: object
+      properties:
+        meta:
+          $ref: '#/components/schemas/Meta'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderRow'
+        limit:
+          type: integer
+        next_cursor:
+          type: integer
+          nullable: true
+          description: null = hết
+      required:
+      - data
+      - limit
+      - meta
+      - next_cursor
+    OrderStatus:
+      type: object
+      properties:
+        code:
+          type: integer
+          nullable: true
+        label:
+          type: string
+          nullable: true
+        bucket:
+          nullable: true
+          description: |-
+            Rổ Báo cáo tổng; cộng theo đây thay cho total/delivered/… cũ
+
+            * `delivered` - delivered
+            * `awaiting` - awaiting
+            * `returned` - returned
+            * `return_risk` - return_risk
+            * `cancelled` - cancelled
+          oneOf:
+          - $ref: '#/components/schemas/OrderStatusBucketEnum'
+          - $ref: '#/components/schemas/NullEnum'
+      required:
+      - bucket
+      - code
+      - label
+    OrderStatusBucketEnum:
+      enum:
+      - delivered
+      - awaiting
+      - returned
+      - return_risk
+      - cancelled
+      type: string
+      description: |-
+        * `delivered` - delivered
+        * `awaiting` - awaiting
+        * `returned` - returned
+        * `return_risk` - return_risk
+        * `cancelled` - cancelled
+    PlatformEnum:
+      enum:
+      - facebook
+      - google
+      type: string
+      description: |-
+        * `facebook` - facebook
+        * `google` - google
+    SalesStatus:
+      type: object
+      properties:
+        code:
+          type: string
+          nullable: true
+        label:
+          type: string
+          nullable: true
+        bucket:
+          nullable: true
+          description: |-
+            Rổ lead; null = chưa đánh giá (unassessed cũ)
+
+            * `closed` - closed
+            * `calling` - calling
+            * `unreached` - unreached
+            * `nurture` - nurture
+            * `wants_store_visit` - wants_store_visit
+            * `dirty` - dirty
+            * `not_buying` - not_buying
+            * `underlying_condition` - underlying_condition
+            * `warranty` - warranty
+            * `cancelled` - cancelled
+            * `archived` - archived
+            * `other` - other
+          oneOf:
+          - $ref: '#/components/schemas/SalesStatusBucketEnum'
+          - $ref: '#/components/schemas/NullEnum'
+      required:
+      - bucket
+      - code
+      - label
+    SalesStatusBucketEnum:
+      enum:
+      - closed
+      - calling
+      - unreached
+      - nurture
+      - wants_store_visit
+      - dirty
+      - not_buying
+      - underlying_condition
+      - warranty
+      - cancelled
+      - archived
+      - other
+      type: string
+      description: |-
+        * `closed` - closed
+        * `calling` - calling
+        * `unreached` - unreached
+        * `nurture` - nurture
+        * `wants_store_visit` - wants_store_visit
+        * `dirty` - dirty
+        * `not_buying` - not_buying
+        * `underlying_condition` - underlying_condition
+        * `warranty` - warranty
+        * `cancelled` - cancelled
+        * `archived` - archived
+        * `other` - other
+    StaffRef:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+          nullable: true
+      required:
+      - id
+      - name
+    StatusEnum:
+      enum:
+      - ok
+      - degraded
+      type: string
+      description: |-
+        * `ok` - ok
+        * `degraded` - degraded
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Token
+servers:
+- url: '{base}/api/daily-report'
+  variables:
+    base:
+      default: https://crm.example.vn
+      description: Domain CRM

@@ -1,0 +1,59 @@
+// Grafana Alloy — thu log mọi container Docker trên host và đẩy vào Loki
+// (docs/ops-hardening-2026-07.md). Cần mount /var/run/docker.sock (read-only).
+//
+// Label đính kèm mỗi stream: container (tên container, vd desi-web),
+// service/project (từ label compose). Backend bật LOG_FORMAT=json thì query
+// theo request_id bằng LogQL: {container="desi-web"} | json | request_id="..."
+
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "15s"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // "/desi-web" → "desi-web"
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.process.scrub_secrets.receiver]
+}
+
+// Che secret TRƯỚC khi vào Loki (audit 2026-09-23 H2): access token JWT từng đi
+// qua query string WebSocket (`/ws/crm/?token=...`) và uvicorn ghi nguyên request
+// line → 112 dòng/24h chứa token sống 1 năm trong Loki/Grafana. Backend đã có
+// filter tương đương (apps/common/log_scrub.py) nhưng đây là lớp độc lập: mọi
+// container (nginx/proxy/worker) đều qua đây. Chỉ nhóm bắt (giá trị sau `token=`)
+// bị thay bằng ***; phần còn lại của dòng giữ nguyên để LogQL vẫn khớp.
+loki.process "scrub_secrets" {
+  forward_to = [loki.write.default.receiver]
+
+  stage.replace {
+    expression = "(?i)token=([^&\\s\"']+)"
+    replace    = "***"
+  }
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

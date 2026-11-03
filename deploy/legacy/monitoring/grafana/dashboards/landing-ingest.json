@@ -1,0 +1,164 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "graphTooltip": 0,
+  "id": null,
+  "title": "Landing Ingest",
+  "uid": "desi-landing-ingest",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-24h", "to": "now"},
+  "tags": ["desi", "landing"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Received (24h)",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(desi_landing_ingest_received_total[24h]))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Created (24h)",
+      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(desi_landing_ingest_processed_total{result=\"created\"}[24h]))",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Dry-run skipped (24h)",
+      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(desi_landing_ingest_processed_total{result=\"dry_run_skipped\"}[24h]))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "orange"}}}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Failed (24h)",
+      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(desi_landing_ingest_processed_total{result=\"failed\"}[24h]))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "red"}}}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Funnel — received → validated → enqueued → processed",
+      "gridPos": {"x": 0, "y": 4, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {
+          "expr": "sum(rate(desi_landing_ingest_received_total{token=\"ok\"}[5m]))",
+          "legendFormat": "received",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(desi_landing_ingest_validated_total{result=\"valid\"}[5m]))",
+          "legendFormat": "validated",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(desi_landing_ingest_enqueued_total{result=\"success\"}[5m]))",
+          "legendFormat": "enqueued",
+          "refId": "C"
+        },
+        {
+          "expr": "sum by (result) (rate(desi_landing_ingest_processed_total[5m]))",
+          "legendFormat": "processed/{{result}}",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Errors — token invalid, validation invalid, enqueue failed",
+      "gridPos": {"x": 0, "y": 13, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {
+          "expr": "sum(rate(desi_landing_ingest_received_total{token=\"invalid\"}[5m]))",
+          "legendFormat": "token_invalid",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(desi_landing_ingest_validated_total{result=\"invalid\"}[5m]))",
+          "legendFormat": "validation_invalid",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(desi_landing_ingest_enqueued_total{result=\"failed\"}[5m]))",
+          "legendFormat": "enqueue_failed",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(desi_landing_ingest_processed_total{result=\"failed\"}[5m]))",
+          "legendFormat": "task_failed",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Task latency (p50 / p95)",
+      "gridPos": {"x": 12, "y": 13, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(desi_landing_ingest_process_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(desi_landing_ingest_process_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    }
+  ]
+}

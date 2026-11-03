@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>https://delax.vn/</title>
+<style>
+  @page {
+    margin: 8mm 10mm;
+    @top-left { content: ""; }
+    @top-center { content: ""; }
+    @top-right { content: ""; }
+    @bottom-left { content: ""; }
+    @bottom-center { content: ""; }
+    @bottom-right { content: ""; }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    font-size: 12px;
+    line-height: 1.35;
+    color: #222;
+    background: #fff;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .slip-page {
+    max-width: 700px;
+    margin: 0 auto;
+    padding: 10px 0;
+  }
+  @media print {
+    .slip-page { max-width: 100%; padding: 0; }
+  }
+
+  /* Title */
+  .slip-title {
+    text-align: center;
+    font-size: 18px;
+    font-weight: 700;
+    text-transform: uppercase;
+    margin-bottom: 2px;
+  }
+  .invoice-code-line {
+    text-align: center;
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+
+  /* Barcode / QR */
+  .barcode-section {
+    text-align: center;
+    margin-bottom: 4px;
+  }
+  .barcode-section img.barcode-img {
+    max-width: 420px;
+    width: 75%;
+    height: 55px;
+    display: block;
+    margin: 0 auto 2px;
+  }
+  .barcode-section img.qr-img {
+    width: 110px;
+    height: 110px;
+    display: block;
+    margin: 0 auto 2px;
+  }
+  .delivery-code-big {
+    font-size: 18px;
+    font-weight: 700;
+    text-align: center;
+    margin: 2px 0;
+  }
+  .delivery-code-line {
+    text-align: center;
+    font-size: 12px;
+    margin-bottom: 2px;
+  }
+  .sort-code {
+    text-align: center;
+    font-size: 16px;
+    font-weight: 700;
+    margin: 2px 0 4px;
+  }
+
+  /* Delivery partner */
+  .partner-line {
+    text-align: center;
+    font-size: 12px;
+    margin-bottom: 2px;
+  }
+  .kiotviet-tag {
+    height: 14px;
+    vertical-align: middle;
+    margin-left: 4px;
+  }
+  .service-line {
+    text-align: center;
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+
+  /* Sender / Receiver */
+  .info-block {
+    margin-bottom: 5px;
+    line-height: 1.35;
+    font-size: 12px;
+  }
+  .info-block .label {
+    font-weight: 700;
+    text-decoration: underline;
+  }
+
+  /* COD */
+  .cod-line {
+    margin: 5px 0;
+    font-size: 12px;
+  }
+  .cod-line .label { font-weight: 700; }
+  .cod-line .amount {
+    font-size: 15px;
+    font-weight: 700;
+  }
+
+  /* Notes */
+  .notes-block {
+    margin-bottom: 5px;
+    font-size: 12px;
+    line-height: 1.3;
+  }
+  .notes-block .label {
+    font-weight: 700;
+    text-decoration: underline;
+  }
+
+  /* Order info */
+  .order-info {
+    margin-bottom: 5px;
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .order-info .label {
+    font-weight: 700;
+    text-decoration: underline;
+  }
+
+  /* Product table */
+  .product-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11.5px;
+    page-break-inside: avoid;
+  }
+  .product-table th,
+  .product-table td {
+    border: 1px solid #333;
+    padding: 3px 5px;
+    vertical-align: top;
+  }
+  .product-table th {
+    font-weight: 700;
+    text-align: center;
+    background: #fff;
+  }
+  .product-table td.center { text-align: center; }
+  .product-table td.stt { text-align: center; width: 32px; }
+  .product-table td.sku { width: 64px; }
+  .product-table td.qty { text-align: center; width: 32px; }
+</style>
+</head>
+<body>
+
+<div class="slip-page">
+  <!-- Title -->
+  <div class="slip-title">Phiếu Giao Hàng</div>
+  <div class="invoice-code-line">Mã hóa đơn: {{ invoice_code }}</div>
+
+  <!-- Barcode of delivery code -->
+  {% if barcode_data_uri %}
+  <div class="barcode-section">
+    <img src="{{ barcode_data_uri }}" alt="barcode" class="barcode-img">
+  </div>
+  {% endif %}
+
+  <!-- Delivery code big -->
+  {% if delivery_code %}
+  <div class="delivery-code-big">{{ delivery_code }}</div>
+  {% endif %}
+
+  <!-- QR code of delivery code -->
+  {% if qr_data_uri %}
+  <div class="barcode-section">
+    <img src="{{ qr_data_uri }}" alt="QR" class="qr-img">
+  </div>
+  {% endif %}
+
+  <!-- Mã vận đơn line -->
+  {% if delivery_code %}
+  <div class="delivery-code-line">Mã vận đơn: <strong>{{ delivery_code }}</strong></div>
+  {% endif %}
+
+  <!-- Sort code -->
+  {% if sort_code %}
+  <div class="sort-code">{{ sort_code }}</div>
+  {% endif %}
+
+  <!-- Delivery partner & service -->
+  {% if partner_name %}
+  <div class="partner-line">Đơn vị giao hàng: {{ partner_name }} <img src="{{ kiotviet_tag_data_uri }}" alt="KiotViet" class="kiotviet-tag"></div>
+  {% endif %}
+  {% if service_text %}
+  <div class="service-line">Dịch vụ: {{ service_text }}</div>
+  {% endif %}
+
+  <!-- Sender -->
+  <div class="info-block">
+    <span class="label">Người gửi: <strong>{{ sender_name }} - {{ sender_phone }}</strong></span><br>
+    {{ sender_address }}
+  </div>
+
+  <!-- Receiver -->
+  <div class="info-block">
+    <span class="label">Người nhận: <strong>{{ receiver_name }} - {{ receiver_phone }}</strong></span><br>
+    {{ receiver_address }}
+  </div>
+
+  <!-- COD -->
+  <div class="cod-line">
+    <span class="label">Tổng thu người nhận:</span>
+    <span class="amount">{{ cod_display }} VND</span>
+  </div>
+
+  <!-- Notes -->
+  {% if shipping_notes %}
+  <div class="notes-block">
+    <span class="label">Lưu ý khi giao hàng:</span> <strong>{{ shipping_notes|linebreaksbr }}</strong>
+  </div>
+  {% endif %}
+
+  <!-- Order info -->
+  <div class="order-info">
+    <span class="label">Thông tin đơn hàng:</span><br>
+    Khối lượng: {{ weight_display }} g<br>
+    Tổng số sản phẩm: {{ total_quantity }}
+  </div>
+
+  <!-- Product table -->
+  <table class="product-table">
+    <thead>
+      <tr>
+        <th>STT</th>
+        <th>Mã hàng</th>
+        <th>Tên hàng</th>
+        <th>SL</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td class="stt">{{ forloop.counter }}</td>
+        <td class="sku">{{ item.code }}</td>
+        <td>{{ item.name }}</td>
+        <td class="qty">{{ item.quantity }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,366 @@
+# STAGING stack — snapshot dữ liệu prod, cách ly side-effects.
+# Xem docs/staging-environment.md (thiết kế + runbook đầy đủ).
+#
+# Nguyên tắc:
+#   - Project name riêng ("desi-order-staging") → network/volume tự prefix,
+#     KHÔNG BAO GIỜ tham chiếu desi-order_default hay desi-order_pg_data của prod.
+#   - Dữ liệu nạp từ dump backup prod qua scripts/staging-refresh.sh (một chiều).
+#   - APP_ENV=staging + KIOTVIET_API_MODE=mock hardcode; KHÔNG truyền LARK_* /
+#     BEST_EXPRESS_* / ZENIFY_* — settings guard sẽ refuse boot nếu các biến này
+#     lọt vào với giá trị non-empty.
+#   - KHÔNG có service beat: cron của hệ là loại gọi ra ngoài (reconcile, import,
+#     ads sync, Lark). staging_neutralize cũng tắt toàn bộ PeriodicTask trong DB.
+#
+# Khởi động:
+#   cp .env.staging.example .env.staging   # điền secrets MỚI (không copy từ prod)
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging up -d --build
+#
+# Nạp dữ liệu:
+#   DESI_STAGING_DUMP=/opt/desi-staging/desi_YYYYMMDD.dump.gz ./scripts/staging-refresh.sh
+
+name: desi-order-staging
+
+x-backend-env: &backend-env
+  APP_ENV: staging
+  DJANGO_DEBUG: "0"
+  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?DJANGO_SECRET_KEY is required}
+  DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?DJANGO_ALLOWED_HOSTS is required}
+  DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-}
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+  # Param hóa cho validate PgBouncer (runbook 2026-07-24-pgbouncer-cutover.md):
+  # đặt DB_TARGET_HOST=pgbouncer, DB_TARGET_PORT=6432, DB_PGBOUNCER=1 trong .env.
+  # Biến riêng chứ KHÔNG passthrough ${POSTGRES_HOST} — xem prod compose: .env của
+  # host giữ POSTGRES_HOST=localhost cho tooling, rò vào container là chết boot.
+  POSTGRES_HOST: ${DB_TARGET_HOST:-postgres}
+  POSTGRES_PORT: ${DB_TARGET_PORT:-5432}
+  POSTGRES_DB: ${POSTGRES_DB:-desi}
+  POSTGRES_USER: ${POSTGRES_USER:-desi}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+  # Passthrough cho psycopg3 tắt prepared statement khi đi qua pooler (xem prod compose).
+  DB_PGBOUNCER: ${DB_PGBOUNCER:-0}
+  # Rỗng = để settings tự suy từ DB_PGBOUNCER (0 không pooler / 600 qua pooler).
+  DJANGO_CONN_MAX_AGE: ${DJANGO_CONN_MAX_AGE:-}
+  # Trần truy vấn DB đồng thời cho bắt tay WebSocket, mỗi worker (xem prod compose).
+  WS_HANDSHAKE_DB_CONCURRENCY: ${WS_HANDSHAKE_DB_CONCURRENCY:-8}
+  # Trần fallback lúc phân quyền event broadcast (sự cố 2026-07-29, xem prod compose).
+  WS_BROADCAST_DB_CONCURRENCY: ${WS_BROADCAST_DB_CONCURRENCY:-4}
+  # Cache trên instance riêng `redis-cache`, mirror prod (audit 2026-08-11 §2.1).
+  # Giá trị literal, không passthrough — xem ghi chú cùng chỗ ở compose prod.
+  REDIS_CACHE_HOST: redis-cache
+  REDIS_CACHE_DB: "0"
+  # Prod-parity (audit 2026-08-19 P2): prod bật 120s từ lâu, staging/local để
+  # default 0 (tắt) làm mọi đo đạc trước prod lệch hẳn hành vi cache.
+  ORDERS_LIST_COUNT_CACHE_TTL: ${ORDERS_LIST_COUNT_CACHE_TTL:-120}
+  REDIS_CHANNEL_DB: "2"
+  JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:?JWT_SIGNING_KEY is required}
+  # ⚠️ BẮT BUỘC khác prod: ciphertext (token KiotViet/Best/ads) restore từ prod
+  # trở thành vô nghĩa trên staging — lớp bảo vệ thứ 2 sau staging_neutralize.
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required (44-byte base64 Fernet key, KHÁC prod)}
+  # mock cứng — settings guard refuse boot nếu ai đó override thành live.
+  KIOTVIET_API_MODE: mock
+  # ── Khóa vận hành (Lark bot/OpenAPI, Gemini, QA, Zenify, Foxia push, Pancake, CNV,
+  # token API vào, portal/QR, KIOTVIET_WEBHOOK_SECRET…) đã chuyển vào DB (apps.sysconfig —
+  # Cài đặt → Cấu hình hệ thống), KHÔNG còn inject qua anchor này — xem docs/system-settings.md.
+  # Settings guard fail-fast nếu container còn thấy khóa registry trong env; cờ dưới chỉ
+  # mở cửa sổ deploy chuyển đổi (=1 → chỉ cảnh báo), phải gỡ sau.
+  SYSCONFIG_ALLOW_ENV_KEYS: ${SYSCONFIG_ALLOW_ENV_KEYS:-}
+  HERMES_THROTTLE_RATE: ${HERMES_THROTTLE_RATE:-600/hour}
+  DAILY_REPORT_THROTTLE_RATE: ${DAILY_REPORT_THROTTLE_RATE:-300/hour}
+  INTERNAL_AUTH_TOKEN: ${INTERNAL_AUTH_TOKEN:?INTERNAL_AUTH_TOKEN is required}
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  LOG_FORMAT: ${LOG_FORMAT:-text}
+  TASK_BACKEND: celery
+  AUDIT_BACKEND: celery
+  CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-2}
+  # Recycle child trước khi OOM killer SIGKILL (rò rỉ connection — xem prod compose).
+  CELERY_WORKER_MAX_TASKS_PER_CHILD: ${CELERY_WORKER_MAX_TASKS_PER_CHILD:-300}
+  CELERY_WORKER_MAX_MEMORY_PER_CHILD: ${CELERY_WORKER_MAX_MEMORY_PER_CHILD:-180000}
+  PROMETHEUS_MULTIPROC_DIR: /tmp/prom_multiproc
+  PYTHONUNBUFFERED: "1"
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+  MINIO_BUCKET_ATTENDANCE: ${MINIO_BUCKET_ATTENDANCE:-attendance}
+  # Portal tra cứu bảo hành public (tra-cuu.delax.asia) — xem docs/warranty-portal-design.md.
+  # Thời hạn BH, retention log quét, token Zalo OA ở DB sysconfig; ở đây chỉ còn throttle.
+  WARRANTY_PORTAL_ACTIVATE_RATE: ${WARRANTY_PORTAL_ACTIVATE_RATE:-10/hour}
+  WARRANTY_PORTAL_READ_RATE: ${WARRANTY_PORTAL_READ_RATE:-120/hour}
+  WARRANTY_PORTAL_MEDIA_RATE: ${WARRANTY_PORTAL_MEDIA_RATE:-600/hour}
+  # Trang sản phẩm public /sp/<mã> (docs/product-scan-page-design.md) — bucket ảnh sản
+  # phẩm. URL in lên tem QR + thông tin công ty footer ở DB sysconfig.
+  MINIO_BUCKET_PRODUCTS: ${MINIO_BUCKET_PRODUCTS:-product-media}
+  # ── Xuất file chạy nền (apps.exports) — spec 2026-08-06 ──
+  CELERY_EXPORTS_QUEUE: ${CELERY_EXPORTS_QUEUE:-exports}
+  MINIO_BUCKET_EXPORTS: ${MINIO_BUCKET_EXPORTS:-desi-exports}
+  # Role chỉ-đọc schema ai cho agent Hermes — chỉ lệnh ai_mart_grant_role dùng.
+  HERMES_DB_PASSWORD: ${HERMES_DB_PASSWORD:-}
+  EXPORT_FILE_TTL_HOURS: ${EXPORT_FILE_TTL_HOURS:-24}
+  EXPORT_SOFT_TIME_LIMIT: ${EXPORT_SOFT_TIME_LIMIT:-600}
+  EXPORT_MAX_ACTIVE_JOBS_PER_USER: ${EXPORT_MAX_ACTIVE_JOBS_PER_USER:-5}
+  EXPORT_CREATE_THROTTLE_RATE: ${EXPORT_CREATE_THROTTLE_RATE:-30/hour}
+  # Đẩy đơn landing sang Foxia (spec 2026-09-09). Cờ FOXIA_PUSH_ENABLED ở DB sysconfig
+  # với staging_forbidden=True → staging luôn đọc False (cùng nguyên tắc: staging không
+  # gọi ra đối tác thật; order_push_service còn chặn thêm theo IS_STAGING). worker-foxia
+  # ở đây vẫn nghe queue foxia,foxia_push (topology khớp prod) nhưng không có gì để enqueue.
+  CELERY_FOXIA_PUSH_QUEUE: ${CELERY_FOXIA_PUSH_QUEUE:-foxia_push}
+
+x-backend-build: &backend-build
+  context: ./backend
+  dockerfile: Dockerfile
+
+services:
+  postgres:
+    image: public.ecr.aws/docker/library/postgres:16-alpine
+    container_name: desi-staging-postgres
+    shm_size: 512m
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-desi}
+      POSTGRES_USER: ${POSTGRES_USER:-desi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c effective_cache_size=1GB
+      -c maintenance_work_mem=256MB
+      -c work_mem=16MB
+      -c max_connections=60
+      -c idle_in_transaction_session_timeout=60000
+      -c tcp_keepalives_idle=60
+      -c tcp_keepalives_interval=10
+      -c tcp_keepalives_count=6
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-desi} -d ${POSTGRES_DB:-desi}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks: [staging-net]
+    # Chỉ localhost — pg_restore chạy qua docker exec, không cần mở port ngoài.
+    ports:
+      - "127.0.0.1:${STAGING_POSTGRES_PORT:-8543}:5432"
+
+  redis:
+    image: public.ecr.aws/docker/library/redis:7-alpine
+    container_name: desi-staging-redis
+    command:
+      - sh
+      - -c
+      - >
+        exec redis-server
+        --requirepass "$$REDIS_PASSWORD"
+        --appendonly no
+        --maxmemory-policy noeviction
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks: [staging-net]
+
+  # Instance cache riêng — mirror prod (docs/cache-latency-optimization-2026-08-11.md §3.1).
+  # Staging PHẢI có service này: lần cutover PgBouncer đã không validate được trên
+  # staging chỉ vì compose staging thiếu service tương ứng, phải làm thẳng trên prod.
+  redis-cache:
+    image: public.ecr.aws/docker/library/redis:7-alpine
+    container_name: desi-staging-redis-cache
+    command:
+      - sh
+      - -c
+      - >
+        exec redis-server
+        --requirepass "$$REDIS_PASSWORD"
+        --save ""
+        --appendonly no
+        --maxmemory ${REDIS_CACHE_MAXMEMORY:-128mb}
+        --maxmemory-policy allkeys-lru
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks: [staging-net]
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: desi-staging-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks: [staging-net]
+
+  web:
+    build: *backend-build
+    container_name: desi-staging-web
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /tmp/prom_multiproc && rm -f /tmp/prom_multiproc/*
+        # Migration luôn nối thẳng Postgres, không qua pooler (xem prod compose).
+        POSTGRES_HOST=postgres POSTGRES_PORT=5432 DB_PGBOUNCER=0 python manage.py migrate --noinput
+        python manage.py collectstatic --noinput
+        exec gunicorn config.asgi:application -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --workers ${WEB_WORKERS:-2} --threads ${WEB_THREADS:-4} --max-requests 1000 --max-requests-jitter 100 --access-logfile -
+    restart: unless-stopped
+    networks: [staging-net]
+    ports:
+      - "127.0.0.1:${STAGING_WEB_PORT:-8100}:8000"   # host nginx → staging web
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/orders/metrics', timeout=2).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  worker:
+    build: *backend-build
+    container_name: desi-staging-worker
+    environment:
+      <<: *backend-env
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q default,orders,lark_noti,audit -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
+    restart: unless-stopped
+    networks: [staging-net]
+
+  worker-kiotviet:
+    build: *backend-build
+    container_name: desi-staging-worker-kiotviet
+    environment:
+      <<: *backend-env
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q kiotviet -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=2
+    restart: unless-stopped
+    networks: [staging-net]
+
+  # Queue `slow` (audit 2026-07-26): job callcenter gọi Gemini + precompute báo cáo.
+  # Staging giữ đúng TOPOLOGY của prod (nay 4 worker) để lỗi định tuyến queue lộ ra
+  # ở đây trước, nhưng concurrency=1: staging không có tải thật, thêm slot chỉ tốn
+  # RAM. Staging không đặt mem_limit cho worker nào (khác prod) nên cũng không cần
+  # chỉnh ngưỡng recycle RSS theo concurrency.
+  # Từ 2026-09-09: queue `foxia` không còn nghe ở đây nữa — chuyển sang container
+  # riêng `worker-foxia` (xem service đó) cùng lý do với prod.
+  worker-slow:
+    build: *backend-build
+    container_name: desi-staging-worker-slow
+    environment:
+      <<: *backend-env
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q slow -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=1
+    restart: unless-stopped
+    networks: [staging-net]
+
+  # Worker riêng cho queue `exports`, cùng topology với prod (xem worker-slow ở
+  # trên: KHÔNG dùng chung `slow` vì queue đó ôm job Gemini 300–480s + precompute
+  # báo cáo 900s — Excel người dùng xếp sau job LLM 8 phút thì mất hết ý nghĩa
+  # chạy nền). Staging không có tải thật nên concurrency=1, không đặt mem_limit
+  # (khác prod) nên cũng không cần chỉnh ngưỡng recycle RSS theo concurrency.
+  worker-export:
+    build: *backend-build
+    container_name: desi-staging-worker-export
+    environment:
+      <<: *backend-env
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q exports -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=1
+    restart: unless-stopped
+    # Cùng lý do prod (xem docker-compose.prod.yml): mặc định Docker 10s cắt ngang
+    # gần mọi job export đang chạy mỗi lần recreate. Job vượt quá vẫn được
+    # purge_expired_exports cứu ở nhịp beat kế — staging không cần khắt khe bằng
+    # prod (không có tải thật) nhưng giữ cùng giá trị cho nhất quán hành vi giữa
+    # hai môi trường.
+    stop_grace_period: 90s
+    networks: [staging-net]
+
+  # Container RIÊNG cho Foxia (spec 2026-09-09), cùng topology với prod (xem
+  # docker-compose.prod.yml): queue `foxia` (backfill CRM, time_limit 900s) và
+  # `foxia_push` (đẩy đơn landing, một request HTTP ngắn) tách khỏi `worker-slow`
+  # để chiều đẩy đơn không xếp hàng sau job Gemini/backfill dài. Staging không có
+  # tải thật nên concurrency=1, không đặt mem_limit (khác prod) nên cũng không
+  # cần chỉnh ngưỡng recycle RSS theo concurrency.
+  worker-foxia:
+    build: *backend-build
+    container_name: desi-staging-worker-foxia
+    environment:
+      <<: *backend-env
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q foxia,foxia_push -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=1
+    restart: unless-stopped
+    networks: [staging-net]
+
+  # KHÔNG có service beat — chủ đích (xem đầu file). Cần test 1 task định kỳ cụ thể:
+  # docker exec desi-staging-worker celery -A config call <task-name>
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: desi-staging-frontend
+    restart: unless-stopped
+    networks: [staging-net]
+    ports:
+      - "127.0.0.1:${STAGING_FRONTEND_PORT:-8101}:80"  # host nginx → staging fe
+
+volumes:
+  pg_data:      # compose tự prefix: desi-order-staging_pg_data — tách hẳn volume prod
+  minio_data:
+
+networks:
+  staging-net:
+    # Network nội bộ của project desi-order-staging — KHÔNG external, không đụng
+    # desi-order_default của prod.
+    driver: bridge

@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>https://delax.vn/</title>
+<style>
+  @page {
+    margin: 10mm 12mm;
+    /* Ẩn URL, ngày giờ, tên trang ở header/footer khi in */
+    @top-left { content: ""; }
+    @top-center { content: ""; }
+    @top-right { content: ""; }
+    @bottom-left { content: ""; }
+    @bottom-center { content: ""; }
+    @bottom-right { content: ""; }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    font-size: 12px;
+    line-height: 1.4;
+    color: #222;
+    background: #fff;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .invoice-page {
+    max-width: 700px;
+    margin: 0 auto;
+    padding: 14px 0;
+  }
+  @media print {
+    .invoice-page { max-width: 100%; padding: 0; }
+  }
+
+  /* Header */
+  .header { text-align: center; margin-bottom: 10px; }
+  .header .logo-img {
+    max-width: 140px;
+    height: auto;
+    margin: 0 auto 2px;
+    display: block;
+  }
+  .header .company-info {
+    font-size: 11px;
+    color: #333;
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+
+  /* Invoice title */
+  .invoice-title {
+    text-align: center;
+    margin: 8px 0 6px;
+  }
+  .invoice-title h2 {
+    font-size: 15px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .invoice-title .invoice-meta {
+    font-size: 12px;
+    color: #333;
+    margin-top: 2px;
+  }
+
+  /* Customer info */
+  .customer-info {
+    margin-bottom: 8px;
+    line-height: 1.45;
+    font-size: 12px;
+  }
+
+  /* Product table */
+  .product-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 8px;
+  }
+  .product-table th {
+    border-top: 2px solid #222;
+    border-bottom: 2px solid #222;
+    padding: 4px 6px;
+    font-weight: 700;
+    font-size: 12px;
+    text-align: left;
+  }
+  .product-table th.right,
+  .product-table td.right { text-align: right; }
+  .product-table th.center,
+  .product-table td.center { text-align: center; }
+  .product-table td {
+    padding: 4px 6px;
+    vertical-align: top;
+    font-size: 11.5px;
+  }
+  .product-table .product-desc {
+    line-height: 1.35;
+  }
+  .product-table tbody tr { border-bottom: 1px dashed #ccc; }
+  .product-table tbody tr:last-child { border-bottom: none; }
+
+  /* Summary */
+  .summary-section {
+    border-top: 2px dashed #aaa;
+    padding-top: 6px;
+    margin-top: 4px;
+  }
+  .summary-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .summary-table td {
+    padding: 2px 6px;
+    font-size: 12px;
+  }
+  .summary-table .label {
+    text-align: right;
+    font-weight: 600;
+    width: 70%;
+  }
+  .summary-table .value {
+    text-align: right;
+    width: 30%;
+  }
+  .summary-table .total-row .label,
+  .summary-table .total-row .value {
+    font-size: 13px;
+    font-weight: 700;
+  }
+
+  /* E-invoice / QR */
+  .einvoice-section {
+    text-align: center;
+    margin-top: 10px;
+  }
+  .einvoice-title {
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 2px;
+  }
+  .einvoice-link {
+    font-size: 11px;
+    color: #333;
+    margin-bottom: 4px;
+    word-break: break-all;
+  }
+  .qr-img {
+    width: 100px;
+    height: 100px;
+  }
+
+  /* Footer */
+  .footer {
+    text-align: center;
+    margin-top: 12px;
+    font-style: italic;
+    color: #1a7a5a;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+
+<div class="invoice-page">
+  <!-- Header -->
+  <div class="header">
+    <img src="{{ logo_data_uri }}" alt="DELAX" class="logo-img">
+    <div class="company-info">
+      <strong>{DELAX VN}</strong><br>
+      Địa chỉ: số 60 Đại Mỗ - Phường Văn Quán - Quận Hà Đông, Hà Nội<br>
+      Điện thoại: 0867385459
+    </div>
+  </div>
+
+  <!-- Invoice title -->
+  <div class="invoice-title">
+    <h2>Hóa Đơn Bán Hàng</h2>
+    <div class="invoice-meta">
+      Số HĐ: {{ invoice_code }}<br>
+      Ngày {{ invoice_date }}
+    </div>
+  </div>
+
+  <!-- Customer info -->
+  <div class="customer-info">
+    Khách hàng: <strong>{{ customer_name }}</strong><br>
+    SĐT: {{ customer_phone }}<br>
+    Địa chỉ: {{ customer_address }}
+  </div>
+
+  <!-- Product table -->
+  <table class="product-table">
+    <thead>
+      <tr>
+        <th style="width: 50%">Đơn giá</th>
+        <th class="center" style="width: 10%">SL</th>
+        <th class="right" style="width: 40%">Thành tiền</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td colspan="3" class="product-desc">{{ item.description }}</td>
+      </tr>
+      <tr>
+        <td>{{ item.unit_price_display }}</td>
+        <td class="center">{{ item.quantity }}</td>
+        <td class="right">{{ item.line_total_display }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <!-- Summary -->
+  <div class="summary-section">
+    <table class="summary-table">
+      <tr>
+        <td class="label">Tổng tiền hàng:</td>
+        <td class="value">{{ subtotal_display }}</td>
+      </tr>
+      <tr>
+        <td class="label">Chiết khấu:</td>
+        <td class="value">{{ discount_display }}</td>
+      </tr>
+      <tr>
+        <td class="label">{{ vat_label }}</td>
+        <td class="value">{{ vat_display }}</td>
+      </tr>
+      <tr class="total-row">
+        <td class="label">Tổng thanh toán:</td>
+        <td class="value">{{ grand_total_display }}</td>
+      </tr>
+      <tr>
+        <td class="label">Nợ cũ:</td>
+        <td class="value">0</td>
+      </tr>
+      <tr>
+        <td class="label">Khách thanh toán:</td>
+        <td class="value">{{ prepaid_display }}</td>
+      </tr>
+      <tr class="total-row">
+        <td class="label">Còn lại:</td>
+        <td class="value">{{ remaining_display }}</td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- QR + e-invoice -->
+  <div class="einvoice-section">
+    <div class="einvoice-title">Hóa đơn điện tử</div>
+    <div class="einvoice-link">Link tra cứu: {{ invoice_lookup_url }}</div>
+    <img src="{{ qr_data_uri }}" alt="QR" class="qr-img">
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    Cảm ơn và hẹn gặp lại!
+  </div>
+</div>
+
+</body>
+</html>

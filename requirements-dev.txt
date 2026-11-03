@@ -1,0 +1,14 @@
+# Dev/CI-only tools — KHÔNG cài vào image prod.
+# Kiểm tra contract phân tầng import giữa các app (backend/.importlinter).
+import-linter==2.12
+# Lint Python. Cấu hình ở pyproject.toml [tool.ruff]. Ghim phiên bản để hook local,
+# máy dev và CI (khi dựng lại) cùng thấy một tập lỗi — ruff đổi rule khá nhanh.
+ruff==0.16.1
+# Type check. Phạm vi GIỚI HẠN ở pyproject.toml [tool.mypy] (apps/*/contracts/ +
+# apps/common/) — cùng triết lý "chặn nợ mới" của ruff/import-linter, mở rộng dần.
+# django-stubs nằm trong dải compatible-mypy của mypy 2.3 (>=1.13,<2.4).
+mypy==2.3.1
+django-stubs==6.1.0
+# Coverage dòng cho job backend:test (audit 2026-09-23 C9). Chạy tay:
+#   pytest apps --cov=apps --cov-report=term-missing
+pytest-cov==7.0.0

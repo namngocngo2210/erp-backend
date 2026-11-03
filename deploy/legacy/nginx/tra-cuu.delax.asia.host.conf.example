@@ -1,0 +1,123 @@
+# Host nginx vhost cho tra-cuu.delax.asia — portal tra cứu bảo hành công khai
+# (KHÔNG dùng nginx container — đây là bản dùng trên PROD hiện tại, upstream
+# trỏ 127.0.0.1 giống customer.delax.vn.host.conf.example).
+#
+# Bản `tra-cuu.delax.asia.conf.prod-template` cạnh file này dùng DNS container
+# (`web:8000` / `frontend:80`) — chỉ đúng khi nginx chạy TRONG compose. Prod
+# hiện tại chạy nginx systemd trên host nên PHẢI dùng file này.
+#
+# Cài đặt:
+#   sudo cp nginx/tra-cuu.delax.asia.host.conf.example \
+#           /etc/nginx/sites-available/tra-cuu.delax.asia
+#   sudo ln -s /etc/nginx/sites-available/tra-cuu.delax.asia \
+#              /etc/nginx/sites-enabled/tra-cuu.delax.asia
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Yêu cầu TRƯỚC khi enable:
+#   1) DNS `tra-cuu.delax.asia` đã trỏ về IP máy chủ này.
+#   2) Chứng chỉ TLS cho domain — zone `.asia` KHÁC `.vn` nên KHÔNG dùng lại
+#      cert của customer.delax.vn được. Cấp mới bằng certbot:
+#        sudo certbot --nginx -d tra-cuu.delax.asia
+#      (chạy SAU khi copy file này và `nginx -t` sạch; certbot tự điền lại 2
+#      dòng ssl_certificate bên dưới. Nếu dùng Cloudflare Origin cert thì thay
+#      thủ công bằng đường dẫn cert `*.delax.asia`.)
+#   3) Compose chạy với web bind 127.0.0.1:8000 (frontend 127.0.0.1:8001).
+#   4) Zone rate limit đã cài (directive `limit_req` bên dưới phụ thuộc):
+#        sudo cp nginx/rate-limit-zones.conf.example \
+#                /etc/nginx/conf.d/00-rate-limit-zones.conf
+#      File zones đã có sẵn `desi_portal` (10r/m). Thiếu file → `nginx -t` báo
+#      "unknown limit_req zone" và nginx KHÔNG reload được.
+#   5) `.env` prod thêm domain vào DJANGO_ALLOWED_HOSTS và
+#      DJANGO_CSRF_TRUSTED_ORIGINS (https://tra-cuu.delax.asia) rồi recreate web.
+#   6) Firewall origin chỉ nhận 80/443 từ dải IP Cloudflare — throttle của portal
+#      tin header CF-Connecting-IP, ai gọi thẳng IP máy chủ sẽ vượt trần 10/giờ.
+#
+# CỐ Ý KHÔNG mở trên domain này: `/api/` chung, `/api/users/*`, `/ws/`,
+# `/nginx_status`, `/api/orders/*`. Domain khách chỉ cần portal + API portal.
+
+server {
+    listen 80;
+    server_name tra-cuu.delax.asia;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    # Cú pháp `listen ... http2` (KHÔNG dùng directive `http2 on;`): nginx trên
+    # host prod hiện tại < 1.25.1 nên `http2 on;` báo `unknown directive` và
+    # `nginx -t` fail. Dạng này chạy được trên mọi phiên bản (từ 1.25.1 chỉ
+    # cảnh báo deprecated, không lỗi).
+    listen 443 ssl http2;
+    server_name tra-cuu.delax.asia;
+
+    # certbot sẽ ghi đè 2 dòng này khi chạy `certbot --nginx -d tra-cuu.delax.asia`.
+    ssl_certificate     /etc/letsencrypt/live/tra-cuu.delax.asia/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/tra-cuu.delax.asia/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    server_tokens off;
+
+    client_max_body_size 2m;
+
+    location = /healthz {
+        return 200 'ok';
+        add_header Content-Type text/plain;
+    }
+
+    # Khách vào gốc domain → portal. PHẢI là redirect thật (302), KHÔNG dùng
+    # `rewrite ^ /bao-hanh last;`: rewrite chỉ đổi URI nội bộ trong nginx, thanh
+    # địa chỉ trình duyệt vẫn là `/` → frontend/src/main.tsx rẽ nhánh theo
+    # `window.location.pathname` sẽ không thấy `/bao-hanh` và render app CRM
+    # (khách nhìn thấy màn đăng nhập nội bộ thay vì trang tra cứu).
+    location = / {
+        return 302 https://$host/bao-hanh;
+    }
+
+    # ── API portal public: zone riêng, chặt hơn /api/ chung vì không đăng nhập ──
+    location /api/warranty-portal/ {
+        limit_req zone=desi_portal burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # File tĩnh nằm ở GỐC bundle: logo `/delax.png`, `/favicon.png`, và các file
+    # do vite-plugin-pwa sinh (`/manifest.webmanifest`, `/registerSW.js`,
+    # `/sw.js`). Không có block này thì `location /` bên dưới redirect 302 chúng
+    # về /bao-hanh → trình duyệt nhận HTML và báo "Refused to execute script …
+    # MIME type ('text/html')" + "Manifest: Syntax error", trang không chạy.
+    # Regex chỉ khớp MỘT đoạn đường dẫn nên không đụng /assets/*.
+    location ~* ^/[^/]+\.(png|jpe?g|gif|svg|ico|webp|txt|xml|json|webmanifest|js|mjs|css|map|woff2?|ttf)$ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+    }
+
+    # ── Bundle SPA ──
+    location /assets/ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        expires 1y;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    location /bao-hanh {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Mọi path khác trên domain khách → về portal, không lộ SPA nội bộ.
+    location / {
+        return 302 https://$host/bao-hanh;
+    }
+}

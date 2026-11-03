@@ -1,0 +1,497 @@
+# Prometheus alert rules cho desi-order.
+# Phủ: liveness các target, Postgres, Redis, host (node-exporter), container (cadvisor)
+# và backend app. Celery: xem celery-exporter trong monitoring/docker-compose.yml
+# (profile monitoring) — rule queue-backlog ở nhóm celery bên dưới.
+groups:
+  - name: liveness
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Target {{ $labels.job }} ({{ $labels.instance }}) down"
+          description: "Prometheus không scrape được {{ $labels.job }} quá 2 phút."
+
+      - alert: BackendDown
+        expr: up{job="desi-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend web (desi-backend) không phản hồi /metrics"
+          description: "App backend down > 1 phút — kiểm tra container desi-web."
+
+  - name: postgres
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL down"
+          description: "postgres-exporter báo pg_up=0 > 1 phút."
+
+      # for: 1m chứ không phải 5m — sự cố 2026-07-23 là một BÃO 2 phút (3 → 99
+      # connection trong đúng một lần scrape rồi về lại 3). Với for: 5m alert này
+      # im lặng suốt sự cố, trong khi app đã ném 162 FATAL "too many clients".
+      # `on(instance)` là BẮT BUỘC: vế trái sau `sum by (instance)` chỉ còn label
+      # `instance`, còn pg_settings_max_connections giữ nguyên `job` (+ label khác của
+      # exporter). Vector matching mặc định đòi khớp TOÀN BỘ label nên phép so sánh
+      # trần trụi trả rỗng — alert im lặng vĩnh viễn. Sự cố 2026-07-29 phát hiện qua
+      # log ứng dụng chứ không qua cảnh báo, dù 23/07 đã hạ `for` xuống 1m.
+      - alert: PostgresTooManyConnections
+        expr: >
+          sum(pg_stat_activity_count) by (instance)
+          > on(instance)
+          (max by (instance) (pg_settings_max_connections) * 0.85)
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Postgres gần cạn connection (>85% max)"
+          description: "Số kết nối đã vượt 85% max_connections > 1 phút — nguy cơ 'too many clients'. Bão ngắn thường là hàng loạt client reconnect cùng lúc; soi pg_stat_activity theo application_name."
+
+      # Bắn NGAY tại một mẫu scrape duy nhất, không chờ `for`. Sự cố 2026-07-31:
+      # hai cú vọt 3 → 99 connection sống đúng MỘT mẫu 15s rồi biến mất — rule
+      # >85% với `for: 1m` phía trên im lặng cả hai lần, y như 29/07. Gauge lấy
+      # 15s/lần nên vẫn có điểm mù dưới một chu kỳ scrape; tầng bù là
+      # log_connections của Postgres (xem docker-compose.prod.yml) — alert này chỉ
+      # cần đánh thức người trực và chỉ chỗ soi.
+      - alert: PostgresConnectionSpike
+        expr: >
+          sum(pg_stat_activity_count) by (instance)
+          > on(instance)
+          (max by (instance) (pg_settings_max_connections) * 0.85)
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Connection Postgres vọt >85% max trong một mẫu scrape"
+          description: "Bão connection ngắn (dưới 1 phút — kiểu 2026-07-31: 3→99 rồi tự hồi trong một mẫu 15s). Truy thủ phạm: PromQL `sum by (datname, usename, state) (pg_stat_activity_count)` tại đúng mốc bắn, hoặc Loki {container=\"desi-postgres\"} dòng 'connection authorized' quanh mốc đó."
+
+      # Steady-state prod chỉ ~20 connection (web 3 + worker 8 + beat 1 + exporter).
+      # Chạm 50% max là đã bất thường — cảnh báo ở đây để bắt rò rỉ hàng giờ TRƯỚC
+      # khi ngưỡng 85% ở trên nổ và app bắt đầu ném "too many clients already".
+      - alert: PostgresConnectionLeak
+        expr: >
+          sum(pg_stat_activity_count) by (instance)
+          > on(instance)
+          (max by (instance) (pg_settings_max_connections) * 0.5)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Connection Postgres tăng bất thường (>50% max, 15 phút)"
+          description: "Nghi rò rỉ connection (backend mồ côi do OOM-kill, hoặc idle in transaction). Kiểm tra pg_stat_activity theo client_addr + state."
+
+      # cadvisor đếm sự kiện OOM trong cgroup. Celery prefork: OOM killer giết CHILD
+      # chứ không giết PID 1 → container không restart, sự cố diễn ra âm thầm và
+      # mỗi lần bỏ lại 1 connection Postgres mồ côi. Đây là early-warning cho alert trên.
+      - alert: ContainerOOMKill
+        expr: increase(container_oom_events_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} bị OOM kill"
+          description: "{{ $value }} sự kiện OOM trong 15 phút. Với celery worker: hạ CELERY_WORKER_MAX_MEMORY_PER_CHILD hoặc nâng mem_limit."
+
+      # Nguồn sự thật ở TẦNG ỨNG DỤNG, bù cho điểm mù của hai rule phía trên: chúng
+      # đọc pg_stat_activity_count — gauge lấy mỗi ~15s, nên bão ngắn hơn một chu kỳ
+      # scrape là vô hình. Counter này chỉ tăng khi một request THẬT đã hỏng, nên
+      # không có ngưỡng nào để lách: >0 là đã có người dùng nhận 500.
+      # Nguồn metric: apps/common/exceptions.py._record_db_connection_error.
+      - alert: DbConnectionPoolExhausted
+        expr: increase(desi_db_connection_errors_total{reason="too_many_clients"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Request hỏng vì cạn connection Postgres"
+          description: "{{ $value }} request nhận 'too many clients already' trong 5 phút. Soi pg_stat_activity theo application_name; xem docs/ws-broadcast-db-fanout-2026-07-29.md."
+
+      # Gate concurrency HTTP trả 503 là người dùng THẬT vừa mất một thao tác
+      # (sự cố 2026-08-03 13:46: 258 request bị từ chối trong 2 phút, chỉ biết
+      # khi người dùng kêu — gate lúc đó chỉ ghi log). Cùng triết lý counter
+      # như DbConnectionPoolExhausted: >0 là đã có thiệt hại, không có ngưỡng
+      # nào để lách. Nguồn metric: apps/common/asgi_concurrency.py.
+      - alert: HttpGateTimeouts
+        expr: sum by (path_prefix) (increase(desi_http_gate_timeouts_total[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gate concurrency từ chối request ({{ $labels.path_prefix }})"
+          description: "{{ $value | printf \"%.0f\" }} request chờ quá WEB_HTTP_QUEUE_TIMEOUT rồi nhận 503 trong 5 phút. Slot đầy vì burst hoặc vì request giữ slot quá lâu — đối chiếu p95 desi_http_request_duration_seconds của route tương ứng."
+
+      - alert: PostgresDeadlocks
+        expr: increase(pg_stat_database_deadlocks[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Phát hiện deadlock trong Postgres"
+          description: "Có {{ $value }} deadlock trong 5 phút gần nhất."
+
+  - name: redis
+    rules:
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis down (broker Celery + Channels)"
+          description: "redis_up=0 > 1 phút — async pipeline + websocket sẽ ngừng."
+
+      # `redis_memory_max_bytes` = 0 khi instance KHÔNG đặt maxmemory (mặc định
+      # của redis). Chia cho 0 ra +Inf, luôn > 0.9 → alert bắn vĩnh viễn dù redis
+      # mới dùng vài chục MB (báo động giả 22/09/2026 trên broker desi-redis-managed).
+      # Guard `> 0` để chỉ xét instance thực sự có đặt trần bộ nhớ.
+      - alert: RedisHighMemory
+        expr: redis_memory_max_bytes > 0 and redis_memory_used_bytes / redis_memory_max_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis dùng >90% maxmemory"
+          description: "Redis sắp đầy bộ nhớ — nguy cơ evict/OOM."
+
+  - name: host
+    rules:
+      - alert: HostDiskWillFill
+        expr: (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) < 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk {{ $labels.mountpoint }} còn <10%"
+          description: "Ổ đĩa sắp đầy trên {{ $labels.instance }} — DB/backup có thể lỗi ghi."
+
+      - alert: HostHighMemory
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAM host >90%"
+          description: "Bộ nhớ host gần cạn > 10 phút."
+
+      - alert: HostHighCpu
+        expr: (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU host >90%"
+          description: "CPU cao kéo dài > 10 phút trên {{ $labels.instance }}."
+
+  - name: backup
+    rules:
+      # Metric do scripts/desi-backup.sh ghi qua textfile collector của
+      # node-exporter. 26h (93600s) = cron daily + 2h dung sai. Absent luôn
+      # (chưa từng backup / textfile chưa mount) cũng phải bắn.
+      - alert: BackupStale
+        expr: (time() - desi_backup_last_success_timestamp) > 93600 or absent(desi_backup_last_success_timestamp)
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backup Postgres đã cũ quá 26h (hoặc chưa từng chạy)"
+          description: "desi_backup_last_success_timestamp quá hạn — kiểm tra cron desi-backup.sh + mount textfile node-exporter."
+
+      # Backup chạy được nhưng CHỈ nằm local trên VPS — VPS chết là mất cả DB
+      # lẫn backup (RB.3). Nhắc dai (warning) cho tới khi bật offsite.
+      - alert: BackupOffsiteNotConfigured
+        expr: desi_backup_offsite_configured == 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backup CHƯA có offsite (chỉ local trên VPS)"
+          description: "Cấu hình DESI_BACKUP_RCLONE_DEST / DESI_BACKUP_S3_DEST + DESI_BACKUP_REQUIRE_OFFSITE=1 — xem docs/ops-hardening-2026-07.md."
+
+      # Offsite từng bật nhưng lần upload thành công gần nhất đã quá 26h
+      # (backup local vẫn OK thì BackupStale im lặng — cần rule riêng này).
+      - alert: BackupOffsiteStale
+        expr: desi_backup_offsite_configured == 1 and (time() - desi_backup_offsite_last_success_timestamp) > 93600
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backup offsite đã cũ quá 26h"
+          description: "Upload offsite (rclone/S3) không thành công gần đây — kiểm tra credential/quota bucket + log /var/log/desi-backup.log."
+
+  - name: celery
+    rules:
+      # Yêu cầu celery-exporter (danihodovic/celery-exporter) — bật service
+      # celery-exporter ở monitoring/docker-compose.yml. Nếu chưa export metric
+      # thì rule này im lặng (no data), không gây nhiễu.
+      - alert: CeleryQueueBacklog
+        expr: sum(celery_queue_length) by (queue_name) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hàng đợi Celery {{ $labels.queue_name }} tồn >100 job"
+          description: "Backlog Celery kéo dài > 10 phút — worker không theo kịp."
+
+      # Task nền hỏng lặp lại. Cron precompute report (rebuild_segment_snapshot, 2h)
+      # trước đây nuốt lỗi từng bước rồi vẫn báo succeeded — sự cố 2026-07-22 hỏng
+      # 2/5 bước suốt nhiều chu kỳ mà không có tín hiệu nào. Task giờ ném
+      # PrecomputeStepsFailed, rule này biến nó thành alert.
+      - alert: CeleryTaskFailing
+        expr: sum(increase(celery_task_failed_total[1h])) by (name) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Task Celery {{ $labels.name }} fail trong 1h qua"
+          description: "{{ $value }} lần fail. Xem log worker theo tên task để biết bước nào hỏng."
+
+      # `ExportJobsFailing` (dựa trên export_jobs_total{status="failed"}) đã bị xoá ở
+      # đợt sửa trước-merge cuối cùng: metric đó chỉ `.inc()` trong tiến trình
+      # desi-worker-export, PROMETHEUS_MULTIPROC_DIR là thư mục CỤC BỘ từng
+      # container (không phải volume chung), và Prometheus chỉ scrape đúng một
+      # target ứng dụng (web:8000) — nên số đếm này KHÔNG BAO GIỜ tới được
+      # Prometheus, alert cũ im lặng vĩnh viễn (báo giả "đang giám sát"). Cách duy
+      # nhất hiện tại để biết job export thất bại là query bảng export_jobs — xem
+      # docs/runbooks/export-jobs.md mục 7. Nợ: cần một đường đưa metric worker tới
+      # Prometheus trước khi khôi phục alert này (ghi ở mục 10 của spec
+      # docs/superpowers/specs/2026-08-06-async-export-jobs-design.md).
+
+      # Queue `exports` riêng (CELERY_EXPORTS_QUEUE, xem
+      # config/settings_parts/celery.py) — tách khỏi CeleryQueueBacklog (ngưỡng
+      # 100, chung cho mọi queue) vì export là tác vụ người dùng đang chờ trực
+      # tiếp trên panel, ngưỡng chịu được phải thấp hơn nhiều. `celery_queue_length`
+      # là metric THẬT do celery-exporter (danihodovic/celery-exporter, xem
+      # monitoring/docker-compose.yml) phát ra — đã dùng ở CeleryQueueBacklog phía
+      # trên, không phải đoán tên.
+      - alert: ExportQueueBacklog
+        expr: celery_queue_length{queue_name="exports"} > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hàng đợi xuất file tồn đọng"
+          description: "Queue `exports` còn {{ $value | printf \"%.0f\" }} job tồn đọng (>20) trong 10 phút — cân nhắc tăng EXPORT_WORKER_CONCURRENCY."
+
+      # worker-export chết là điểm mù CỦA CHÍNH rule ExportQueueBacklog ở trên: khi
+      # không còn worker nào nghe queue `exports`, celery-exporter không phát ra
+      # series `celery_queue_length{queue_name="exports"}` nữa (biến MẤT, không phải
+      # tăng lên) — rule dùng ngưỡng ">20" im lặng vĩnh viễn đúng lúc cần báo nhất.
+      # `absent()` là cách duy nhất bắt được kịch bản "series không tồn tại".
+      - alert: ExportWorkerMissing
+        expr: absent(celery_queue_length{queue_name="exports"})
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Không thấy worker-export tiêu thụ queue exports"
+          description: "celery_queue_length{queue_name=\"exports\"} vắng mặt > 10 phút — worker-export có thể đã chết hoặc chưa từng lên. Job export mới sẽ nằm PENDING vô thời hạn. Kiểm `docker compose -f docker-compose.prod.yml ps worker-export`."
+
+  - name: ai_mart
+    rules:
+      # ETL trễ âm thầm là chế độ hỏng nguy hiểm nhất (spec §9) — task fail thì
+      # CeleryTaskFailing (group celery, ở trên) đã bắt được vì cùng dùng
+      # celery_task_failed_total. Nhưng task KHÔNG CHẠY (beat chết, queue kẹt)
+      # thì không có event fail nào để đếm — chỉ có luật "vắng thành công quá
+      # lâu" mới bắt được. celery_task_succeeded_total cùng họ metric với
+      # celery_task_failed_total, do celery-exporter (danihodovic/celery-exporter)
+      # phát ra, đã dùng ở group celery phía trên — không phải đoán tên.
+      #
+      # HAI ĐIỀU KIỆN TIÊN QUYẾT (sự cố 2026-09-22, ba rule dưới nổ liên tục dù
+      # ETL chạy đúng nhịp):
+      #  1. Worker phải phát task events — CELERY_WORKER_SEND_TASK_EVENTS=True
+      #     (settings_parts/celery.py). Mặc định Celery là False; khi đó exporter
+      #     chỉ thấy heartbeat, celery_task_*_total không tồn tại, nhánh absent
+      #     nổ vĩnh viễn còn CeleryTaskFailing thì câm.
+      #  2. Dạng rule: `sum(increase(...[W])) == 0 or absent_over_time(...[W])`,
+      #     KHÔNG dùng `absent()` hay increase theo từng series. Exporter gắn
+      #     hostname (= container id) vào series và purge toàn bộ series của
+      #     worker 10' sau khi nó offline; mỗi deploy đổi hostname. `absent()`
+      #     đúng suốt từ lúc deploy tới lượt chạy kế tiếp — với rebuild 1 lần/đêm
+      #     là báo giả gần 24h sau MỖI deploy. absent_over_time chỉ đúng khi cả
+      #     cửa sổ không có mẫu nào; sum() gộp hostname cũ + mới để một lượt
+      #     thành công ở bất kỳ worker nào cũng tính. Test: alerts_test.yml.
+      - alert: AiMartSyncSilent
+        expr: sum(increase(celery_task_succeeded_total{name="apps.ai_mart.tasks.sync_hot_marts"}[90m])) == 0 or absent_over_time(celery_task_succeeded_total{name="apps.ai_mart.tasks.sync_hot_marts"}[90m])
+        # Một nhịp 30' + biên: lượt sync xong trong <1 scrape (15s) sinh series thẳng ở 1, increase=0 tới lượt kế.
+        for: 35m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ETL schema ai không chạy >90 phút"
+          description: "Không có lượt sync_hot_marts thành công nào trong 90 phút (nhịp chuẩn 30'), hoặc metric vắng mặt hoàn toàn (worker-slow/beat chưa từng chạy task này). Kiểm beat + queue slow."
+
+      # rebuild_all_marts chạy đêm (nhịp chuẩn 1 lần/ngày) — khác hẳn sync_hot_marts
+      # (30'). Nó là đường nạp DUY NHẤT cho san_pham/ton_kho/chi_phi_quang_cao (nhóm
+      # NIGHTLY_MARTS, xem apps/ai_mart/application/etl_service.py) — các bảng này
+      # KHÔNG có candidate incremental nào khác. Rebuild chết âm thầm thì 3 bảng đó
+      # đóng băng vĩnh viễn mà AiMartSyncSilent không hề bắt được (nó chỉ theo dõi
+      # sync_hot_marts). Ngưỡng 26h (không phải 24h) để chừa biên trễ lịch cron.
+      - alert: AiMartRebuildSilent
+        expr: sum(increase(celery_task_succeeded_total{name="apps.ai_mart.tasks.rebuild_all_marts"}[26h])) == 0 or absent_over_time(celery_task_succeeded_total{name="apps.ai_mart.tasks.rebuild_all_marts"}[26h])
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rebuild đêm schema ai không chạy >26 giờ"
+          description: "san_pham/ton_kho/chi_phi_quang_cao KHÔNG có đường nạp tăng dần — rebuild đêm chết là 3 bảng đó đóng băng, và mất luôn cơ chế tự lành cho nhóm nóng."
+
+      # sync_hot_marts đã được AiMartSyncSilent canh — cầu FDW chết là job raise,
+      # không có lượt succeeded nào và alert đó nổ trong 90'.
+      #
+      # PHẠM VI CỦA RULE NÀY HẸP HƠN TÊN NÓ: expr chỉ đếm lượt task SUCCEEDED,
+      # nên nó canh SỰ SỐNG của beat + worker queue slow, KHÔNG canh việc nhãn
+      # có thực sự được sinh ra. run_batch() trả về summary bình thường (task
+      # THÀNH CÔNG) trong cả 4 tình huống "đứng im mà vẫn xanh":
+      #   AI_CHAT_EXTRACT_ENABLED=0 · GEMINI_API_KEY rỗng · cooldown 429 đang bật
+      #   · mọi dòng trong lô đều lỗi.
+      # Xây gauge độ sâu hàng đợi để bắt 4 ca đó cần một exporter metric nghiệp
+      # vụ mà repo này CHƯA CÓ — nợ có chủ đích, không phải quên. Trong lúc chưa
+      # có: kiểm tay theo mục "Gán nhãn đứng im nhưng alert không kêu" của
+      # docs/runbooks/2026-09-04-ai-chat-mart-deploy.md.
+      - alert: AiChatExtractSilent
+        expr: sum(increase(celery_task_succeeded_total{name="apps.ai_mart.tasks.extract_chat_labels"}[3h])) == 0 or absent_over_time(celery_task_succeeded_total{name="apps.ai_mart.tasks.extract_chat_labels"}[3h])
+        # Một nhịp 10' + biên: khi tắt extract, task xong trong 5ms → series sinh ở 1, increase=0 tới lượt kế.
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Task gán nhãn chat không chạy được lượt nào >3 giờ (beat/worker slow chết)"
+          description: "Không có lượt extract_chat_labels THÀNH CÔNG nào trong 3 giờ (nhịp chuẩn 10', phút 3/13/23/33/43/53) — nghĩa là beat không phát task hoặc worker queue slow chết/kẹt. Kiểm beat schedule ai-mart-chat-extract và worker queue slow trước tiên. CẢNH BÁO PHẠM VI: rule này KHÔNG nổ khi AI_CHAT_EXTRACT_ENABLED=0, khi GEMINI_API_KEY rỗng, khi đang trong cooldown hết quota Gemini, hay khi mọi dòng trong lô đều lỗi — cả 4 ca đó task vẫn kết thúc THÀNH CÔNG mà không sinh nhãn nào. Nhãn đứng im mà rule này im lặng thì kiểm tay theo runbook 2026-09-04-ai-chat-mart-deploy.md mục 'Gán nhãn đứng im nhưng alert không kêu'."
+
+  # ── RED metrics tầng ứng dụng (audit tải 2026-07-24) ───────────────────────
+  # Trước đây MỌI alert đều ở tầng hạ tầng: biết được "Postgres nhiều connection"
+  # hay "host hết RAM", nhưng KHÔNG biết endpoint nào chậm hay đang lỗi. Người
+  # dùng kêu chậm là phải đoán. Nguồn metric: apps/common/http_metrics.py.
+  - name: http-app
+    rules:
+      # Ngưỡng 2s ở p95 cho MỘT route cụ thể. Cố ý không đặt ngưỡng toàn cục:
+      # trung bình toàn hệ thống luôn đẹp vì các endpoint nhẹ áp đảo số lượng,
+      # đúng lý do report chậm 2 tiếng vẫn không kích hoạt alert nào.
+      #
+      # Sàn >= 30 request/10 phút: histogram_quantile nội suy TRONG bucket, nên
+      # route chỉ có 3 request rơi vào bucket 2.5–5s cũng cho "p95 = 4.9s" và
+      # bắn warning (sự cố 2026-09-23 11:09: media download + kship-options, mỗi
+      # route đúng 3 request kể từ lúc restart). Cùng đợt restart 10:09 còn bắn
+      # 4 route khác vì cold start + ít mẫu. Ít hơn 30 mẫu thì p95 là số ngẫu nhiên.
+      #
+      # Loại các route PROXY sang dịch vụ ngoài (ads-crm, KShip setting-service):
+      # thời gian của chúng là thời gian upstream, 2–5s là bình thường và không
+      # có gì bên trong ERP để sửa. HttpEndpointVerySlow (>10s) vẫn canh chúng.
+      - alert: HttpEndpointSlow
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(desi_http_request_duration_seconds_bucket{route!~"\\^api/media/contents/<int:content_id>/(download|video-stream)|\\^api/orders/\\?kship-options"}[10m])) by (le, route)
+          ) > 2
+          and
+          sum(increase(desi_http_requests_total[10m])) by (route) >= 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Endpoint {{ $labels.route }} chậm (p95 > 2s)"
+          description: "p95 = {{ $value | printf \"%.1f\" }}s suốt 10 phút (>= 30 request). Route đọc DB: đối chiếu pg_stat_statements. Route gọi dịch vụ ngoài (KiotViet, ads-crm, Facebook): tra log theo request_id xem upstream mất bao lâu."
+
+      # Endpoint báo cáo vốn nặng — tách ngưỡng riêng để không phải tắt alert trên.
+      # Sàn thấp hơn (>= 5/10 phút) vì report ít lượt gọi nhưng >10s là nghiêm trọng;
+      # vẫn cần sàn để 1 request lẻ rơi vào bucket 10–30s không thành critical.
+      - alert: HttpEndpointVerySlow
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(desi_http_request_duration_seconds_bucket[10m])) by (le, route)
+          ) > 10
+          and
+          sum(increase(desi_http_requests_total[10m])) by (route) >= 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Endpoint {{ $labels.route }} rất chậm (p95 > 10s)"
+          description: "p95 = {{ $value | printf \"%.1f\" }}s (>= 5 request). Gần chạm statement_timeout — người dùng đang thấy treo."
+
+      # Tỉ lệ 5xx theo route. Dùng TỈ LỆ chứ không dùng số tuyệt đối: một endpoint
+      # ít dùng lỗi 100% đáng báo động hơn endpoint bận lỗi 10 lần/giờ.
+      - alert: HttpEndpointErrorRate
+        expr: |
+          (
+            sum(rate(desi_http_requests_total{status=~"5.."}[10m])) by (route)
+            /
+            sum(rate(desi_http_requests_total[10m])) by (route)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Endpoint {{ $labels.route }} lỗi 5xx > 5%"
+          description: "Tỉ lệ lỗi {{ $value | humanizePercentage }} trong 10 phút. Tra log theo request_id."
+
+      # Sập hoàn toàn một endpoint: mọi request đều 5xx. Ngưỡng thấp hơn về thời
+      # gian vì đây là tín hiệu chắc chắn, không cần chờ xác nhận lâu.
+      # Sàn >= 3 request/5 phút: không có sàn thì 1 request lẻ lỗi trên route vắng
+      # (vd <unmatched>) cũng thành "100%" và bắn critical (sự cố 2026-09-23).
+      - alert: HttpEndpointDown
+        expr: |
+          (
+            sum(rate(desi_http_requests_total{status=~"5.."}[5m])) by (route)
+            /
+            sum(rate(desi_http_requests_total[5m])) by (route)
+          ) >= 1
+          and
+          sum(increase(desi_http_requests_total[5m])) by (route) >= 3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Endpoint {{ $labels.route }} lỗi 100%"
+          description: "Toàn bộ request tới route này đều 5xx trong 5 phút."
+
+  # Rate limiting (docs/rate-limiting-hardening-2026-07.md).
+  # Mục tiêu của nhóm này KHÔNG phải bắt kẻ tấn công — mà để biết TA ĐANG CHẶN
+  # NHẦM NGƯỜI DÙNG. Trần được cố ý đặt rộng, nên bất kỳ lượng 429 đều đặn nào
+  # cũng đáng nghi là cấu hình quá chặt trước khi nghi là bị tấn công.
+  - name: rate-limiting
+    rules:
+      - alert: ApiThrottleSpike
+        expr: sum by (scope) (rate(desi_throttled_requests_total{scope!="login"}[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scope {{ $labels.scope }} đang bị throttle liên tục"
+          description: >-
+            {{ $value | printf "%.2f" }} request/s bị từ chối suốt 10 phút. Trần mặc định
+            đặt rộng có chủ đích nên đây nhiều khả năng là CHẶN NHẦM (vd cả văn phòng
+            chung một IP NAT). Nới bằng env USER_THROTTLE_RATE/ANON_THROTTLE_RATE
+            trước, điều tra sau.
+
+      - alert: LoginThrottleSpike
+        expr: sum(rate(desi_throttled_requests_total{scope="login"}[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Nhiều lần đăng nhập bị chặn vì vượt trần"
+          description: >-
+            {{ $value | printf "%.2f" }} lần/s bị chặn. Hai khả năng: credential stuffing,
+            hoặc trần 10/min theo IP đang chặn nhầm cả văn phòng NAT vào giờ cao điểm.
+            Đối chiếu số IP riêng biệt trong access log của nginx trước khi kết luận.
+
+      - alert: OutboundRateLimitSaturated
+        expr: sum by (service) (rate(desi_outbound_rate_limit_exceeded_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gọi ra {{ $labels.service }} chờ quá lâu vẫn chạm trần"
+          description: >-
+            Ta đang tự chặn chính mình: job đồng bộ chờ hết max_wait mà vẫn chưa tới lượt.
+            Hoặc trần KIOTVIET_RATE_LIMIT_PER_SECOND quá chặt, hoặc có job chạy loạn.
+            Kiểm tra desi_outbound_rate_limit_wait_seconds_total để biết đang mất bao lâu.

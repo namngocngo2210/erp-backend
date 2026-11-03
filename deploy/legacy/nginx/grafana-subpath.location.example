@@ -1,0 +1,43 @@
+# Publish Grafana qua nginx host, KHÔNG mở thêm port ra internet.
+# Grafana vẫn bind 127.0.0.1:3001 như cũ; nginx là lớp duy nhất chạm internet
+# nên tận dụng luôn cert Let's Encrypt sẵn có của vhost.
+#
+# Cách dùng:
+#   1. Dán block `location` bên dưới vào server{} 443 của
+#      /etc/nginx/sites-available/customer.delax.vn (vhost phục vụ cả
+#      customer.delax.vn lẫn erp.desiglobal.vn). Đặt TRƯỚC `location /`.
+#   2. .env prod:
+#        GRAFANA_ROOT_URL=https://erp.desiglobal.vn/grafana/
+#        GRAFANA_SERVE_FROM_SUB_PATH=true
+#   3. docker compose -f docker-compose.prod.yml --profile monitoring \
+#        up -d --force-recreate grafana
+#   4. sudo nginx -t && sudo systemctl reload nginx
+#
+# LƯU Ý proxy_pass KHÔNG có dấu "/" ở cuối: với SERVE_FROM_SUB_PATH=true,
+# Grafana tự xử lý prefix /grafana. Thêm "/" (strip prefix) sẽ làm asset và
+# redirect sau login trả về 404.
+#
+# `map $http_upgrade $connection_upgrade` đã khai báo sẵn ở đầu vhost — cần cho
+# Grafana Live (log tail realtime, dashboard auto-refresh qua WebSocket).
+
+    # ── Grafana (monitoring) ──
+    location /grafana {
+        proxy_pass http://127.0.0.1:3001;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket cho Grafana Live
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # Query Loki/Prometheus khoảng thời gian dài có thể chạy lâu.
+        proxy_read_timeout 300s;
+    }
+
+# ── (tuỳ chọn) Giới hạn theo IP văn phòng ──
+# Nếu sau này muốn thu hẹp lại, thêm vào trong location trên:
+#     allow 203.0.113.0/24;   # IP văn phòng
+#     deny  all;

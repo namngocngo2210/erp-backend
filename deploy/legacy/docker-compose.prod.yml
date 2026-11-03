@@ -1,0 +1,1177 @@
+# PRODUCTION stack v0.8.1: connect to existing postgres + redis containers
+# (desi-order-postgres-1 + desi-order-redis-1 đã chạy 2 weeks trên network
+# desi-order_default), thêm Django web + Frontend + Celery worker/beat
+# vào CÙNG network qua external reference.
+#
+# SSL termination + reverse proxy: HOST nginx (systemd) — KHÔNG có nginx
+# trong compose này. Host nginx proxy:
+#   /api/, /ws/, /api/orders/ingest → http://127.0.0.1:8000  (web)
+#   /, /assets/                     → http://127.0.0.1:8001  (frontend)
+#
+# Lý do không định nghĩa postgres/redis ở đây:
+#   - Tránh downtime: data prod đã chạy ổn định trên container cũ
+#   - Tránh risk volume collision: external volume desi-order_pg_data đã có
+#     130GB+ data, không cần re-mount qua container mới
+#   - Plan §19.3 option A: bảo toàn data tại chỗ
+#
+# Khởi động (trên VPS):
+#   cd /home/desi/desi-order
+#   git pull origin master
+#   cp .env.example .env  # chỉnh INTERNAL_AUTH_TOKEN
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   ./scripts/desi-smoke.sh customer.delax.vn
+#
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-production}
+  DJANGO_DEBUG: "0"
+  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?DJANGO_SECRET_KEY is required}
+  DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?DJANGO_ALLOWED_HOSTS is required}
+  DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-}
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+  # Postgres + Redis: connect existing containers (compose v2 service-name DNS
+  # works across same network — postgres/redis hostname resolved bởi
+  # desi-order_default network DNS).
+  # Param hóa để cutover PgBouncer chỉ cần đổi .env, đúng như runbook
+  # 2026-07-24-pgbouncer-cutover.md mô tả: trước 2026-07-30 hai giá trị này bị
+  # hardcode `postgres:5432` nên bước 3 của runbook lặng lẽ vô tác dụng (anchor
+  # env là whitelist).
+  # ⚠️ DÙNG BIẾN RIÊNG DB_TARGET_*, KHÔNG passthrough ${POSTGRES_HOST}: `.env`
+  # (và shell của người chạy compose) đang giữ POSTGRES_HOST theo góc nhìn HOST —
+  # localhost cho psql/script backup. Passthrough thẳng thì container nối
+  # 127.0.0.1:5432 và chết ngay khi boot: "connection refused" (sự cố 2026-07-30
+  # 23:33). Container luôn mặc định là service `postgres`; chỉ cutover mới đổi.
+  POSTGRES_HOST: ${DB_TARGET_HOST:-postgres}
+  POSTGRES_PORT: ${DB_TARGET_PORT:-5432}
+  POSTGRES_DB: ${POSTGRES_DB:-desi}
+  POSTGRES_USER: ${POSTGRES_USER:-desi}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+  # Bật PgBouncer (DB_PGBOUNCER=1 trong .env): settings tắt prepared statement của
+  # psycopg3 + ngừng gửi statement_timeout qua startup options — hai bẫy chết người
+  # của transaction pooling. Thiếu dòng passthrough này thì đặt .env cũng vô nghĩa
+  # (anchor là whitelist) và pooler nổ NGẪU NHIÊN dưới tải.
+  DB_PGBOUNCER: ${DB_PGBOUNCER:-0}
+  # Settings tự suy CONN_MAX_AGE từ DB_PGBOUNCER (không pooler → 0: đóng sau mỗi
+  # request; qua PgBouncer → 600). Passthrough rỗng để derivation hoạt động;
+  # chỉ đặt DJANGO_CONN_MAX_AGE trong .env khi thật sự cần override tường minh.
+  DJANGO_CONN_MAX_AGE: ${DJANGO_CONN_MAX_AGE:-}
+  # Trần truy vấn DB fallback lúc phân quyền event broadcast, MỖI gunicorn worker.
+  # Đường chính không chạm DB (payload tự mang staff_id/channel_code); trần này chặn
+  # trường hợp còn call site sót field — sự cố 2026-07-29.
+  WS_BROADCAST_DB_CONCURRENCY: ${WS_BROADCAST_DB_CONCURRENCY:-4}
+  # Trần truy vấn DB đồng thời cho bắt tay WebSocket, MỖI gunicorn worker (sự cố
+  # 2026-07-23: ~96 tab reconnect cùng lúc → ~96 connection Postgres đồng thời →
+  # cạn max_connections=100). Trần thực tế của web = giá trị này × WEB_WORKERS.
+  WS_HANDSHAKE_DB_CONCURRENCY: ${WS_HANDSHAKE_DB_CONCURRENCY:-8}
+  # Trần request HTTP đồng thời, MỖI gunicorn worker (sự cố 2026-08-03: burst
+  # tạo đơn 10:33 → ~90 connection idle của web đè kịch trần trong 30 giây —
+  # asgiref cấp thread riêng cho TỪNG request, không có pool chặn). Request thừa
+  # xếp hàng chờ (không tốn thread/connection), quá WEB_HTTP_QUEUE_TIMEOUT giây
+  # mới trả 503. Tổng trần thật = giá trị này × WEB_WORKERS.
+  # 12→8 sau bão 2026-08-04 09:13: nút cổ chai là 1.5 CPU (cpus của desi-web),
+  # không phải connection (đã có PgBouncer) — ít thread hơn = ít tranh CPU hơn,
+  # request xong nhanh hơn, slot quay vòng nhanh hơn.
+  WEB_HTTP_CONCURRENCY: ${WEB_HTTP_CONCURRENCY:-8}
+  WEB_HTTP_QUEUE_TIMEOUT: ${WEB_HTTP_QUEUE_TIMEOUT:-15}
+  # Mỗi service tự khai tên trong pg_stat_activity.application_name; các service
+  # bên dưới override giá trị này. Cột rỗng đã khiến điều tra sự cố 2026-07-23
+  # mất 4 vòng chỉ để biết connection đến từ đâu.
+  DB_APPLICATION_NAME: desi-unknown
+  # Cache nằm trên instance RIÊNG `redis-cache` (audit 2026-08-11 §2.1) — giá trị
+  # literal, KHÔNG passthrough `${...}`: biến cùng tên của host sẽ rò vào container
+  # và trỏ cache đi nơi khác (đúng bẫy đã cắn với POSTGRES_HOST, sự cố 2026-07-30).
+  # Instance đó chỉ chứa cache nên dùng DB 0; "1" là giá trị cũ thời dùng chung.
+  # Rollback về dùng chung: xoá 2 dòng này (settings tự rơi về REDIS_HOST + DB 1).
+  REDIS_CACHE_HOST: redis-cache
+  REDIS_CACHE_DB: "0"
+  REDIS_CHANNEL_DB: "2"
+  # Trần thời gian query báo cáo khách hàng full-history (giây) — chặn query runaway.
+  REPORT_QUERY_TIMEOUT_SECONDS: ${REPORT_QUERY_TIMEOUT_SECONDS:-120}
+  # Trần statement_timeout (giây) cho REFRESH MATERIALIZED VIEW schema `dwh`
+  # (apps.analytics.tasks.refresh_dwh_marts, lịch 04:25). 3 mart tuần tự trong 1 task
+  # time_limit=1800 -> 3 × giá trị này phải < 1800, đừng đổi một chỗ mà quên chỗ kia.
+  DWH_REFRESH_TIMEOUT_SECONDS: ${DWH_REFRESH_TIMEOUT_SECONDS:-480}
+  # Trần tuổi (giờ) của mốc refresh mà dwh_reconcile chấp nhận — xem comment ở
+  # settings_parts/base.py.
+  DWH_RECONCILE_MAX_BOUNDARY_AGE_HOURS: ${DWH_RECONCILE_MAX_BOUNDARY_AGE_HOURS:-36}
+  # Cache COUNT danh sách đơn theo bộ lọc (giây). Lật trang cùng bộ lọc tái dùng count.
+  #
+  # 30 → 120 (đo list-timing 2026-08-11): cache đang chạy đúng nhưng TTL quá ngắn
+  # so với nhịp truy cập. Số thật trong 10 mẫu liên tiếp — khi TRÚNG: count 4-18ms,
+  # status_counts 1-7ms; khi TRƯỢT: count 140-353ms, status_counts 114-212ms. Ở tải
+  # thấp (~1 request/11s) TTL 30s làm khoảng 1/3 request phải tự đếm lại, và đúng
+  # những request đó là các request 616-785ms — toàn bộ phần đuôi latency của trang
+  # Đơn hàng nằm ở đây. Đánh đổi: con số tổng/badge trễ tối đa 2 phút, chấp nhận
+  # được vì đó là số đếm tham khảo, không phải dữ liệu giao dịch.
+  ORDERS_LIST_COUNT_CACHE_TTL: ${ORDERS_LIST_COUNT_CACHE_TTL:-120}
+  # Retention lịch sử hành trình đơn (audit 2026-08-19 T5, chốt 2026-08-19): bảng
+  # order_journey_events trước đây GIỮ VĨNH VIỄN (env mặc định 0) nên chỉ tăng.
+  # 180 ngày phủ mọi cửa sổ đọc hiện có (contact list 92 ngày, contact_count/
+  # temperature, nurture_history theo kỳ). Task purge chạy 03:45, batch 10k + lock.
+  JOURNEY_EVENT_RETENTION_DAYS: ${JOURNEY_EVENT_RETENTION_DAYS:-180}
+  # 3 id nghiệp vụ BẮT BUỘC khai trong .env (audit 2026-09-23 T3/P2-7): code không còn
+  # default id prod, settings raise ImproperlyConfigured khi thiếu. `:?` để `compose up`
+  # báo ngay thay vì container web/worker/beat crash-loop. Giá trị cũ: xem runbook B1.
+  SALE_FB_CHANNEL_IDS: ${SALE_FB_CHANNEL_IDS:?SALE_FB_CHANNEL_IDS is required (audit 2026-09-23 B1)}
+  KOC_CHANNEL_ID: ${KOC_CHANNEL_ID:?KOC_CHANNEL_ID is required (audit 2026-09-23 B1)}
+  # Fanout WS theo kênh — GIAI ĐOẠN 2 (audit 2026-09-23 C4): publisher bắn bản sao
+  # diện rộng vào `crm_updates.broad` (chỉ scope all/own join) thay vì `crm_updates`
+  # (mọi client). Bản diện rộng không còn fan-out tới mọi client; sale scope
+  # "channels" hết nhận kênh ngoài phạm vi rồi vứt. Điều kiện: mọi web đã chạy consumer join CRM_BROAD_GROUP
+  # (có từ MR C5 08-19). Đặt 1 để quay về bắn kép nếu cần rollback web cũ.
+  # Xem docs/runbooks/2026-09-23-audit-ops.md mục "Hiệu năng".
+  WS_CHANNEL_FANOUT_PHASE: ${WS_CHANNEL_FANOUT_PHASE:-2}
+  JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:?JWT_SIGNING_KEY is required}
+  # Access token là JWT tự chứa → KHÔNG blacklist được (blacklist chỉ áp cho refresh).
+  # Default cũ 525600' (1 năm) khiến một token rò rỉ dùng được trọn năm, và cách thu hồi
+  # duy nhất là ép user đổi mật khẩu (tăng token_version). FE đã giữ access in-memory +
+  # refresh httpOnly cookie + refresh chủ động trước hạn (frontend/src/services/http.ts),
+  # nên token ngắn KHÔNG làm user bị đá ra. Khớp default an toàn của settings (audit N2).
+  JWT_ACCESS_MINUTES: ${JWT_ACCESS_MINUTES:-60}
+  JWT_REFRESH_DAYS: ${JWT_REFRESH_DAYS:-14}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required (44-byte base64 Fernet key)}
+  KIOTVIET_API_MODE: ${KIOTVIET_API_MODE:-live}
+  # ── Khóa vận hành (Lark bot/OpenAPI, Gemini, QA, Zenify, Foxia push, Pancake, CNV,
+  # token API vào, portal/QR, RECONCILE_DELIVERY_EXACT_MIRROR, KIOTVIET_WEBHOOK_SECRET…)
+  # đã chuyển vào DB (apps.sysconfig — Cài đặt → Cấu hình hệ thống) và KHÔNG còn được
+  # inject qua anchor này — xem docs/system-settings.md. Settings guard
+  # assert_no_registry_env_leftovers fail-fast nếu container còn thấy khóa registry
+  # trong env; cờ dưới chỉ mở cửa sổ deploy chuyển đổi (=1 → chỉ cảnh báo), phải gỡ sau.
+  SYSCONFIG_ALLOW_ENV_KEYS: ${SYSCONFIG_ALLOW_ENV_KEYS:-}
+  # Target cron cập nhật trạng thái đơn (JSON, xem settings_parts/base.py). Từ audit
+  # 2026-09-23 không còn default trong code → bắt buộc khai (runbook B1).
+  KIOTVIET_STATUS_SYNC_TARGETS: ${KIOTVIET_STATUS_SYNC_TARGETS:?KIOTVIET_STATUS_SYNC_TARGETS is required (audit 2026-09-23 B1)}
+  HERMES_THROTTLE_RATE: ${HERMES_THROTTLE_RATE:-600/hour}
+  DAILY_REPORT_THROTTLE_RATE: ${DAILY_REPORT_THROTTLE_RATE:-300/hour}
+  # Best Express: tài khoản (username/password/EMS key/environment) sống trong bảng
+  # BestExpressAccount (Django admin), không còn qua .env. Chỉ token webhook còn ở đây.
+  BEST_EXPRESS_WEBHOOK_TOKEN: ${BEST_EXPRESS_WEBHOOK_TOKEN:-}
+  # CNV Loyalty sync (spec 2026-08-05): client id/secret ở bảng CnvConnection, cờ
+  # CNV_SYNC_ENABLED + URL/account ở DB sysconfig. Ở đây chỉ còn tham số retry + inbound.
+  CNV_SYNC_MAX_ATTEMPTS: ${CNV_SYNC_MAX_ATTEMPTS:-10}
+  # Chiều ngược CNV → desi-order (spec 2026-08-19). Bật sau khi register webhook.
+  CNV_INBOUND_ENABLED: ${CNV_INBOUND_ENABLED:-0}
+  CNV_WEBHOOK_VERIFY_TOKEN: ${CNV_WEBHOOK_VERIFY_TOKEN:-}
+  CNV_WEBHOOK_CALLBACK_URL: ${CNV_WEBHOOK_CALLBACK_URL:-}
+  CNV_WEBHOOK_TOPICS: ${CNV_WEBHOOK_TOPICS:-orders/create,orders/updated}
+  CNV_INBOUND_LOOKBACK_MINUTES: ${CNV_INBOUND_LOOKBACK_MINUTES:-120}
+  CNV_WEBHOOK_EVENT_RETENTION_DAYS: ${CNV_WEBHOOK_EVENT_RETENTION_DAYS:-30}
+  # Foxia (docs/foxia-integration-design.md): kéo đơn + trạng thái từ CRM đối tác.
+  # Endpoint/database/username/api_key KHÔNG ở env — chúng là secret của đối tác,
+  # sống trong bảng foxia_connections với api_key mã hoá, nhập qua Django admin.
+  # ENABLED=0 là cron no-op; `manage.py foxia_probe` vẫn chạy được để dò kết nối.
+  FOXIA_SYNC_ENABLED: ${FOXIA_SYNC_ENABLED:-0}
+  FOXIA_HTTP_TIMEOUT: ${FOXIA_HTTP_TIMEOUT:-30}
+  # Đẩy đơn landing sang Foxia (spec 2026-09-09): cờ FOXIA_PUSH_ENABLED + base URL +
+  # timeout nằm ở DB sysconfig; ở đây chỉ còn tên queue (topology worker-foxia).
+  CELERY_FOXIA_PUSH_QUEUE: ${CELERY_FOXIA_PUSH_QUEUE:-foxia_push}
+  # Zenify Contact Center (webphone + pipeline ghi âm/transcript cuộc gọi —
+  # docs/zenify-call-transcripts.md). Domain/API key/secret + cờ CALL_SYNC ở DB sysconfig;
+  # ở đây chỉ còn base URL + tham số cửa sổ/khớp. Đổi .env xong phải `up -d` để recreate
+  # (anchor này là WHITELIST: biến không khai báo ở đây không bao giờ vào container).
+  ZENIFY_API_BASE_URL: ${ZENIFY_API_BASE_URL:-https://api.zenify.vn}
+  ZENIFY_AGENT_EMAIL: ${ZENIFY_AGENT_EMAIL:-}
+  ZENIFY_CALL_SYNC_WINDOW_MINUTES: ${ZENIFY_CALL_SYNC_WINDOW_MINUTES:-120}
+  ZENIFY_CALL_MATCH_WINDOW_DAYS: ${ZENIFY_CALL_MATCH_WINDOW_DAYS:-30}
+  ZENIFY_CALL_MIN_ACD_SECONDS: ${ZENIFY_CALL_MIN_ACD_SECONDS:-5}
+  ZENIFY_CALL_MATCH_MAX_ATTEMPTS: ${ZENIFY_CALL_MATCH_MAX_ATTEMPTS:-7}
+  # Google AI Studio (Gemini) — transcribe ghi âm. API key/model/RPM/RPD ở DB sysconfig
+  # (key rỗng = task transcribe no-op); ở đây chỉ còn tham số batch/retry/cooldown.
+  GEMINI_MAX_ATTEMPTS: ${GEMINI_MAX_ATTEMPTS:-3}
+  GEMINI_TRANSCRIBE_BATCH: ${GEMINI_TRANSCRIBE_BATCH:-8}
+  # GEMINI_MAX_RPD chỉ là trần phỏng đoán — 429 mới là câu trả lời thật của Google.
+  # Chạm 429 thì nghỉ nguyên chu kỳ này rồi tự probe lại (sự cố 2026-07-22).
+  GEMINI_QUOTA_COOLDOWN_MINUTES: ${GEMINI_QUOTA_COOLDOWN_MINUTES:-60}
+  # Extract chân dung khách từ transcript → OrderAssessment. Cờ GEMINI_EXTRACT_ENABLED
+  # + model ở DB sysconfig (kill switch RIÊNG với ZENIFY_CALL_SYNC_ENABLED).
+  GEMINI_EXTRACT_BATCH: ${GEMINI_EXTRACT_BATCH:-20}
+  GEMINI_EXTRACT_MAX_ATTEMPTS: ${GEMINI_EXTRACT_MAX_ATTEMPTS:-3}
+  GEMINI_EXTRACT_MIN_TRANSCRIPT_CHARS: ${GEMINI_EXTRACT_MIN_TRANSCRIPT_CHARS:-200}
+  # Chấm chất lượng cuộc gọi (docs/superpowers/specs/2026-07-30-call-quality-scoring-design.md).
+  # Cờ QA_SCORING_ENABLED, model, ngưỡng thời lượng/ký tự/điểm đạt ở DB sysconfig.
+  QA_SCORING_BATCH: ${QA_SCORING_BATCH:-20}
+  QA_SCORING_MAX_MINUTES: ${QA_SCORING_MAX_MINUTES:-60}
+  QA_SCORING_MAX_ATTEMPTS: ${QA_SCORING_MAX_ATTEMPTS:-3}
+  PROMETHEUS_MULTIPROC_DIR: /tmp/prom_multiproc
+  PYTHONUNBUFFERED: "1"
+  # Async task backend: Celery (worker + beat). TASK_BACKEND/AUDIT_BACKEND default to "celery".
+  TASK_BACKEND: ${TASK_BACKEND:-celery}
+  AUDIT_BACKEND: ${AUDIT_BACKEND:-celery}
+  # Bắt buộc từ audit 2026-07 (settings guard fail-fast nếu rỗng ở production).
+  INTERNAL_AUTH_TOKEN: ${INTERNAL_AUTH_TOKEN:?INTERNAL_AUTH_TOKEN is required}
+  # Heartbeat healthchecks.io (docs/ops-hardening-2026-07.md) — beat bắn GET mỗi 5'.
+  # Trống = tắt. KHÔNG copy sang staging (settings guard sẽ chặn).
+  OPS_HEARTBEAT_URL: ${OPS_HEARTBEAT_URL:-}
+  # Error tracking (RB.8) — trống = tắt. Áp cho web/worker/beat (cùng anchor env).
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0}
+  # LOG_FORMAT=json bật JSON log kèm request_id (default text).
+  LOG_FORMAT: ${LOG_FORMAT:-text}
+  CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-4}
+  # Recycle child TRƯỚC khi cgroup OOM killer ra tay. Child bị SIGKILL không kịp
+  # đóng connection Postgres → backend mồ côi chiếm slot (xem comment ở service
+  # postgres). Recycle chủ động thì Django đóng connection sạch sẽ.
+  # Ngưỡng RSS (KB) = mem_limit(1024MB) - parent(~180MB) chia concurrency, hạ hệ
+  # số an toàn 0.85 ≈ 180000KB (~175MB)/child. Chỉnh lại nếu đổi concurrency hoặc
+  # mem_limit; đo thực tế bằng `docker stats desi-worker`.
+  CELERY_WORKER_MAX_TASKS_PER_CHILD: ${CELERY_WORKER_MAX_TASKS_PER_CHILD:-300}
+  CELERY_WORKER_MAX_MEMORY_PER_CHILD: ${CELERY_WORKER_MAX_MEMORY_PER_CHILD:-180000}
+  # MinIO (ảnh chấm công) — backend dùng root-credentials làm S3 access/secret key
+  # nên chỉ cần set MINIO_ROOT_USER / MINIO_ROOT_PASSWORD.
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+  MINIO_BUCKET_ATTENDANCE: ${MINIO_BUCKET_ATTENDANCE:-attendance}
+  # Portal tra cứu bảo hành public (tra-cuu.delax.asia) — xem docs/warranty-portal-design.md.
+  # Thời hạn BH, retention log quét, token Zalo OA ở DB sysconfig; ở đây chỉ còn throttle.
+  WARRANTY_PORTAL_ACTIVATE_RATE: ${WARRANTY_PORTAL_ACTIVATE_RATE:-10/hour}
+  WARRANTY_PORTAL_READ_RATE: ${WARRANTY_PORTAL_READ_RATE:-120/hour}
+  WARRANTY_PORTAL_MEDIA_RATE: ${WARRANTY_PORTAL_MEDIA_RATE:-600/hour}
+  # Trang sản phẩm public /sp/<mã> (docs/product-scan-page-design.md) — bucket ảnh sản
+  # phẩm. URL in lên tem QR + thông tin công ty footer ở DB sysconfig.
+  MINIO_BUCKET_PRODUCTS: ${MINIO_BUCKET_PRODUCTS:-product-media}
+  # ── Xuất file chạy nền (apps.exports) — spec 2026-08-06 ──
+  CELERY_EXPORTS_QUEUE: ${CELERY_EXPORTS_QUEUE:-exports}
+  MINIO_BUCKET_EXPORTS: ${MINIO_BUCKET_EXPORTS:-desi-exports}
+  # Role chỉ-đọc schema ai cho agent Hermes — chỉ lệnh ai_mart_grant_role dùng.
+  HERMES_DB_PASSWORD: ${HERMES_DB_PASSWORD:-}
+  EXPORT_FILE_TTL_HOURS: ${EXPORT_FILE_TTL_HOURS:-24}
+  EXPORT_SOFT_TIME_LIMIT: ${EXPORT_SOFT_TIME_LIMIT:-600}
+  EXPORT_MAX_ACTIVE_JOBS_PER_USER: ${EXPORT_MAX_ACTIVE_JOBS_PER_USER:-5}
+  EXPORT_CREATE_THROTTLE_RATE: ${EXPORT_CREATE_THROTTLE_RATE:-30/hour}
+  # Cầu postgres_fdw sang DB desi-crawl-conversations (spec 2026-09-04 C1) —
+  # chỉ lệnh ai_mart_chat_fdw dùng. Container postgres tự mở kết nối này
+  # (không phải web/worker), nhưng settings đọc env này trong Django process
+  # để build DDL/troubleshoot nên vẫn truyền vào web + worker. Mật khẩu
+  # CHAT_CRAWLER_DB_PASSWORD ở DB sysconfig (secret).
+  CHAT_CRAWLER_DB_HOST: ${CHAT_CRAWLER_DB_HOST:-deploy-postgres-1}
+  CHAT_CRAWLER_DB_PORT: ${CHAT_CRAWLER_DB_PORT:-5432}
+  CHAT_CRAWLER_DB_NAME: ${CHAT_CRAWLER_DB_NAME:-crawler}
+  CHAT_CRAWLER_DB_USER: ${CHAT_CRAWLER_DB_USER:-chat_ro}
+  # Gán nhãn hội thoại chat bằng Gemini (spec 2026-09-04 §6). Cờ AI_CHAT_EXTRACT_ENABLED
+  # ở DB sysconfig (bài học 05/09/2026: đặt =1 trong .env mà anchor không passthrough
+  # → 60.435 dòng pending, 0 done, alert không kêu — nay bật/tắt trên UI, hết bẫy).
+  AI_CHAT_EXTRACT_BATCH: ${AI_CHAT_EXTRACT_BATCH:-20}
+  AI_CHAT_EXTRACT_MAX_ATTEMPTS: ${AI_CHAT_EXTRACT_MAX_ATTEMPTS:-3}
+  AI_CHAT_EXTRACT_MIN_CHARS: ${AI_CHAT_EXTRACT_MIN_CHARS:-80}
+  AI_CHAT_EXTRACT_MAX_CHARS: ${AI_CHAT_EXTRACT_MAX_CHARS:-30000}
+
+x-backend-build: &backend-build
+  context: ./backend
+  dockerfile: Dockerfile
+
+services:
+  # ──────────────────────────── DATA ────────────────────────────
+  # Postgres giờ do compose quản lý (trước đây là container "mồ côi" tạo
+  # tay → /dev/shm mặc định 64M, gây "DiskFull: could not resize shared
+  # memory segment" khi parallel query — vd /api/customers/resale).
+  # external volume desi-order_pg_data (130GB+) ĐƯỢC GIỮ NGUYÊN, chỉ
+  # recreate container để áp shm_size. Xem runbook §recreate-postgres.
+  postgres:
+    image: public.ecr.aws/docker/library/postgres:16-alpine
+    container_name: desi-postgres
+    # Default /dev/shm = 64M — quá ít cho parallel query nhiều sub-SELECT.
+    # shared_buffers=1GB → cần shm_size tương xứng để DSM segment có chỗ.
+    shm_size: 1g
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-desi}
+      POSTGRES_USER: ${POSTGRES_USER:-desi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      # Trỏ tới volume external đang chứa data prod — KHÔNG mount init script
+      # restore (data dir đã có dữ liệu, init chỉ chạy khi dir rỗng nhưng vẫn
+      # tránh để loại bỏ mọi rủi ro).
+      - pg_data:/var/lib/postgresql/data
+    # idle_in_transaction_session_timeout + tcp_keepalives_*: lưới an toàn cho
+    # "sorry, too many clients already" (sự cố 2026-07-21). Khi cgroup OOM killer
+    # SIGKILL một celery child, socket phía client chết KHÔNG gửi FIN → backend
+    # Postgres thành mồ côi và (với tcp_keepalives_idle=0 → mặc định OS 7200s)
+    # ngồi chiếm slot 2 TIẾNG. Vài chục lần OOM trong cửa sổ đó là cạn 100 slot.
+    # Keepalive 60s/10s/6 → phát hiện client chết trong ~2 phút.
+    # idle_in_transaction 60s cắt transaction bị bỏ dở (nguồn rò rỉ thứ hai).
+    # pg_stat_statements (audit C1): trước đây KHÔNG có tầng quan sát query nào —
+    # postgres-exporter chỉ thấy connection/lock/cache-hit, không biết query nào tốn
+    # thời gian nhất. Mọi sự cố hiệu năng (report-precompute-timeout, resale-tracking)
+    # đều phải đoán. shared_preload_libraries CHỈ áp dụng khi restart Postgres (không
+    # reload được) — xem runbook docs/runbooks/2026-07-24-enable-pg-stat-statements.md.
+    # Chi phí: ~vài MB shared memory cho 5000 entry.
+    #
+    # max_connections=100 — ĐỪNG hạ xuống 50. Audit DB-4 từng hạ 100→50 với lý do
+    # worst-case work_mem 16MB × nhiều slot + shared_buffers 1GB vượt cgroup
+    # mem_limit 2500m; nhưng 50 là TRẦN CHẬT và đã gây "too many clients" tái diễn
+    # (sự cố 2026-07-30 14:36): trần tĩnh đã ~48 — handshake 8×3=24 + broadcast
+    # fallback 4×3=12 + celery 4+4+2=10 + beat/exporter ~2 — nên một nhịp REST đồng
+    # thời (mỗi request một connection vì CONN_MAX_AGE=0) là tràn. Phép tính cũ
+    # "50 vẫn dư" quên 12 slot fallback và đặt trần HTTP=3 trong khi HTTP không bị cap.
+    # Endgame là profile pgbouncer (docs/runbooks/2026-07-24-pgbouncer-cutover.md)
+    # cap backend THẬT ở ~25 — đường .env đã thông từ 2026-07-30. Nếu còn tràn:
+    # van xả nhanh là hạ WS_HANDSHAKE_DB_CONCURRENCY=4 + WS_BROADCAST_DB_CONCURRENCY=2
+    # trong .env (recreate web) — giải phóng 18 slot.
+    #
+    # log_connections/log_disconnections (sự cố 2026-07-31): hai cú vọt 3→99
+    # connection sống dưới một chu kỳ scrape 15s — gauge của exporter gần như mù,
+    # còn log web/docker thì đã mất sau recreate. Bật log để MỌI connection đều để
+    # lại vết (user + db + host) trong Loki ({container="desi-postgres"}), truy được
+    # thủ phạm hậu kiểm dù bão ngắn cỡ nào. Chi phí: 2 dòng log/connection —
+    # CONN_MAX_AGE=0 nên cỡ vài dòng/giây lúc cao điểm, không đáng kể với Loki.
+    # Lưu ý cả hai tham số này chỉ cần reload (SIGHUP), nhưng khai báo ở command
+    # thì phải recreate container mới ăn; muốn bật ngay không downtime:
+    #   ALTER SYSTEM SET log_connections = 'on'; SELECT pg_reload_conf();
+    # (command-line -c sẽ đè ALTER SYSTEM ở lần recreate kế — giá trị trùng nhau
+    # nên không lệch cấu hình.)
+    # 6 tham số cuối (audit 2026-09-23 database.md P2-4, đo prod 23/09 sau khi
+    # dựng lại cluster 22/09 — mọi giá trị đều đang là mặc định):
+    #   max_wal_size=4GB      : 1GB mặc định ép checkpoint theo WAL (checkpoints_req
+    #                           12%, 18GB WAL/20h do rebuild ai_mart đêm) → 4GB để
+    #                           checkpoint theo thời gian, ghi mượt hơn. Tốn thêm
+    #                           tối đa ~3GB đĩa trong pg_wal.
+    #   random_page_cost=1.1  : mặc định 4 là cho đĩa quay; VPS SSD/NVMe → planner
+    #                           đang né index scan oan (Parallel Seq Scan orders).
+    #   effective_io_concurrency=200 : bitmap heap scan prefetch trên SSD.
+    #   track_io_timing=on    : pg_stat_statements có blk_read_time/blk_write_time
+    #                           — thiếu nó không tách được "chậm vì CPU" hay "vì I/O".
+    #   log_min_duration_statement=2000 : log câu > 2s vào Loki (kèm log_lock_waits)
+    #                           — bằng chứng hậu kiểm cho statement timeout 30s.
+    #   log_lock_waits=on     : log mọi phiên chờ khoá > deadlock_timeout (1s).
+    # Tất cả đều cần RECREATE container (docker compose up -d postgres, downtime
+    # ~30s) — xem docs/runbooks/2026-09-23-audit-ops.md mục Database.
+    # Áp dụng đổi tham số postgres cần recreate container (không reload được).
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.max=5000
+      -c pg_stat_statements.track=top
+      -c pg_stat_statements.track_utility=off
+      -c shared_buffers=1GB
+      -c effective_cache_size=1500MB
+      -c maintenance_work_mem=128MB
+      -c work_mem=16MB
+      -c max_connections=100
+      -c wal_buffers=16MB
+      -c checkpoint_completion_target=0.9
+      -c idle_in_transaction_session_timeout=60000
+      -c tcp_keepalives_idle=60
+      -c tcp_keepalives_interval=10
+      -c tcp_keepalives_count=6
+      -c log_connections=on
+      -c log_disconnections=on
+      -c max_wal_size=4GB
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c track_io_timing=on
+      -c log_min_duration_statement=2000
+      -c log_lock_waits=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-desi} -d ${POSTGRES_DB:-desi}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    # Cầu FDW (ai_mart_chat_fdw) mở kết nối TỪ tiến trình Postgres này sang
+    # deploy-postgres-1 (project desi-crawl-conversations, mạng deploy_default
+    # riêng) — không phải Django, nên chính container này phải attach cả hai
+    # mạng. deploy-postgres-1 chỉ bind 127.0.0.1:15432 nên không đi vòng qua
+    # host được (đo 2026-09-04: hai container ở hai mạng rời, 172.19.0.20 vs
+    # 172.18.0.2).
+    networks: [desi-net, deploy_default]
+    expose: ["5432"]
+    # 🔒 BẢO MẬT: mặc định CHỈ bind 127.0.0.1 → các service nội bộ (web/worker/beat)
+    # kết nối qua network `desi-net` (expose 5432), KHÔNG cần host port.
+    # Nếu cần truy cập admin từ ngoài: override POSTGRES_BIND_IP=<private-ip> và
+    # BẮT BUỘC khoá firewall chỉ cho IP văn phòng
+    # (vd ufw: `ufw allow from <office-ip> to any port 5432`).
+    ports:
+      - "${POSTGRES_BIND_IP:-127.0.0.1}:5432:5432"
+    mem_limit: 2500m
+    cpus: 2.5
+
+  # ──────────────────────── PgBouncer (audit C2) ─────────────────────────
+  # MẶC ĐỊNH KHÔNG CHẠY (profile "pgbouncer"). Lý do tồn tại: max_connections=100
+  # đang là trần cứng, và cách dập lửa sự cố 2026-07-23 là tắt persistent
+  # connection (DJANGO_CONN_MAX_AGE=0) — đúng lúc đó nhưng khiến MỌI request phải
+  # bắt tay TCP + auth Postgres lại từ đầu. PgBouncer transaction pooling gỡ cả
+  # hai: app mở/đóng thoải mái, Postgres chỉ thấy ~25 connection thật.
+  #
+  # ⚠️ CUTOVER KHÔNG PHẢI "up -d" LÀ XONG. Bắt buộc theo
+  # docs/runbooks/2026-07-24-pgbouncer-cutover.md — riêng psycopg3 có bẫy
+  # prepared statement làm hỏng NGẪU NHIÊN dưới tải nếu quên DB_PGBOUNCER=1.
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    container_name: desi-pgbouncer
+    profiles: ["pgbouncer"]
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER:-desi}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      DB_NAME: ${POSTGRES_DB:-desi}
+      # Image edoburu MẶC ĐỊNH nghe 5432 — không khai LISTEN_PORT thì healthcheck,
+      # expose và DB_TARGET_PORT=6432 đều gõ vào cửa không ai nghe ("connection
+      # refused", cutover 2026-08-03 phát hiện khi worker canary chết 10 phút).
+      LISTEN_PORT: "6432"
+      # Console admin (SHOW POOLS/CLIENTS) mặc định chỉ cho user "postgres" —
+      # user đó không có trong userlist.txt sinh từ DB_USER nên không đăng nhập
+      # được. Cho desi làm admin để lệnh giám sát trong runbook chạy được.
+      ADMIN_USERS: ${POSTGRES_USER:-desi}
+      POOL_MODE: transaction
+      # Trần connection THẬT tới Postgres. Giữ thấp hơn max_connections=100 nhiều
+      # để còn chỗ cho migration/psql thủ công/exporter nối thẳng.
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-25}
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-500}
+      RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE:-5}
+      # statement_timeout KHÔNG đi qua startup options nữa khi bật pooler (setting
+      # mức session sẽ rò rỉ giữa các client dùng chung connection) → áp ở đây.
+      SERVER_RESET_QUERY: DISCARD ALL
+      # BẮT BUỘC đi kèm dòng trên khi POOL_MODE=transaction. PgBouncer chỉ chạy
+      # server_reset_query ở session pooling; ở transaction pooling nó BỎ QUA,
+      # trừ khi server_reset_query_always=1 (mặc định 0). Thiếu dòng này thì
+      # DISCARD ALL ở trên là chữ chết — không hề chạy — và đúng cái rò rỉ mà
+      # comment trên mô tả vẫn xảy ra.
+      # Đo thật 22/09/2026: rebuild_all_marts bọc statement_timeout(2400) nhưng
+      # ai.tin_nhan vẫn bị huỷ ở giây thứ 30,3 ("canceling statement due to
+      # statement timeout"), trong khi desi-postgres KHÔNG có statement_timeout
+      # mặc định nào (không ở server -c, không ở pg_roles.rolconfig, không ở
+      # pg_db_role_setting) → trần 30s chỉ có thể là SET mức session của một
+      # client KHÁC còn sót lại trên server connection dùng chung.
+      SERVER_RESET_QUERY_ALWAYS: "1"
+      # psycopg3 gửi các startup param này; PgBouncer từ chối nếu không khai báo.
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits,options,search_path
+      AUTH_TYPE: scram-sha-256
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ${POSTGRES_USER:-desi}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["6432"]
+    mem_limit: 256m
+    cpus: 0.5
+
+  # ──────────────────────── MinIO (ảnh chấm công) ────────────────────────
+  # Object storage S3-compatible. Backend (web/worker) gọi qua hostname `minio`
+  # trên desi-net. API 9000 chỉ nội bộ; console 9001 bind localhost (SSH tunnel).
+  minio:
+    # Pin 2026-07-03: bản community CUỐI CÙNG — MinIO ngừng publish image công khai
+    # (repo archived 04/2026), :latest sẽ không bao giờ có bản mới nữa.
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: desi-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["9000", "9001"]
+    ports:
+      - "${MINIO_CONSOLE_BIND_IP:-127.0.0.1}:9001:9001"
+    mem_limit: 512m
+    cpus: 1.0
+
+  # ──────────────────────── APP — Django ────────────────────────
+  web:
+    build: *backend-build
+    container_name: desi-web
+    environment:
+      <<: *backend-env
+      DB_APPLICATION_NAME: desi-web
+    depends_on:
+      postgres: { condition: service_healthy }
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /tmp/prom_multiproc && rm -f /tmp/prom_multiproc/*
+        # Migration LUÔN nối thẳng Postgres, không qua PgBouncer (bẫy số 3 của
+        # runbook cutover): migrate cần session dài + advisory lock, transaction
+        # pooling phá cả hai. Override tại chỗ nên cutover không đụng dòng này.
+        POSTGRES_HOST=postgres POSTGRES_PORT=5432 DB_PGBOUNCER=0 python manage.py migrate --noinput
+        python manage.py collectstatic --noinput
+        # WEB_MAX_REQUESTS mặc định 0 = TẮT (sự cố 2026-07-23). --max-requests sinh
+        # ra cho gunicorn sync worker; với UvicornWorker phục vụ WebSocket, mỗi lần
+        # recycle cắt đứt TOÀN BỘ WS client đang bám worker đó — vừa mất realtime
+        # của ~1/3 user vài lần mỗi ngày, vừa là ngòi nổ của bão reconnect. Lưới an
+        # toàn rò rỉ RAM đã có mem_limit 1200m + alert ContainerOOMKill. Cần bật lại
+        # thì set WEB_MAX_REQUESTS trong .env.
+        exec gunicorn config.asgi:application -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --workers ${WEB_WORKERS:-3} --threads ${WEB_THREADS:-4} --max-requests ${WEB_MAX_REQUESTS:-0} --max-requests-jitter ${WEB_MAX_REQUESTS_JITTER:-0} --access-logfile -
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["8000"]
+    ports:
+      - "127.0.0.1:8000:8000"   # host nginx → web (chỉ bind localhost)
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/orders/metrics', timeout=2).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    mem_limit: 1200m
+    cpus: 1.5
+
+  # ──────────────────────── Celery worker + beat ─────────────────────────
+  # Tách worker theo queue (audit 2026-07-14 vòng 5): trước đây 1 worker ăn cả 5 queue
+  # — route queue chỉ là nhãn. Giờ reconcile 21h (fan-out per-cặp, tới 65') + cron trạng
+  # thái 30' + ads sync 60s có thể bão hoà toàn bộ slot → tạo đơn landing và thao tác đẩy
+  # KiotViet của user xếp hàng hàng chục phút. Worker chính giữ các queue tương tác
+  # (orders/landing/lark/audit); worker-kiotviet ôm riêng các job sync/reconcile dài;
+  # worker-slow (thêm ở audit 2026-07-26) ôm queue `slow` — job LLM callcenter và
+  # precompute báo cáo, xem comment tại service đó.
+  worker:
+    build: *backend-build
+    container_name: desi-worker
+    environment:
+      <<: *backend-env
+      DB_APPLICATION_NAME: desi-worker
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q default,orders,lark_noti,audit -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=${CELERY_WORKER_CONCURRENCY:-4}
+    restart: unless-stopped
+    networks: [desi-net]
+    healthcheck:
+      # Worker này còn sống và trả lời qua broker không (celery ping).
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$(hostname) --timeout=10 | grep -q pong"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    mem_limit: 1024m
+    cpus: 1.5
+
+  worker-kiotviet:
+    build: *backend-build
+    container_name: desi-worker-kiotviet
+    environment:
+      <<: *backend-env
+      DB_APPLICATION_NAME: desi-worker-kiotviet
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q kiotviet -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=${KIOTVIET_WORKER_CONCURRENCY:-4}
+    restart: unless-stopped
+    networks: [desi-net]
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$(hostname) --timeout=10 | grep -q pong"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    mem_limit: 1024m
+    cpus: 1.0
+
+  # Worker thứ ba cho queue `slow` (audit 2026-07-26 mục T5): 5 task dài/nặng
+  # (3 job callcenter gọi Gemini + 2 job precompute báo cáo khách hàng) trước đây
+  # nằm chung queue `default` với các sweep điều phối lead. Worker `default` chỉ có
+  # 4 slot nên vài job LLM đồng thời là đủ đẩy sweep_lead_assignment / sweep_floating_pool
+  # ra sau hàng chờ — độ trễ mà sale cảm nhận trực tiếp. Route sang queue riêng +
+  # worker riêng để hai nhóm không tranh slot của nhau.
+  #
+  # Từng nghe thêm queue `foxia` (2026-08): job kéo dữ liệu từ CRM đối tác cũng
+  # là I/O dài, cùng họ với nhóm trên. Từ 2026-09-09, `foxia` (và `foxia_push` —
+  # đẩy đơn landing sang Foxia, một request HTTP ngắn) chuyển sang container
+  # riêng `worker-foxia` (xem service đó): việc đẩy đơn không được xếp hàng sau
+  # cả job Gemini 8 phút của `slow` LẪN sau chính job backfill `foxia` 900s.
+  worker-slow:
+    build: *backend-build
+    container_name: desi-worker-slow
+    environment:
+      <<: *backend-env
+      DB_APPLICATION_NAME: desi-worker-slow
+      # Ngưỡng recycle RSS phải tính lại vì concurrency ở đây là 2, KHÔNG phải 4
+      # như anchor *backend-env (anchor đặt 180000KB cho worker `default`).
+      # Công thức giống comment ở anchor:
+      #   (mem_limit 1024MB - parent ~180MB) / concurrency 2 * 0.85 (hệ số an toàn)
+      #   = 844 / 2 * 0.85 ≈ 358MB ≈ 358000KB mỗi child.
+      # Đổi SLOW_WORKER_CONCURRENCY thì PHẢI đổi giá trị này theo, nếu không child
+      # sẽ bị cgroup OOM killer SIGKILL trước khi Celery kịp recycle → connection
+      # Postgres mồ côi chiếm slot (xem comment service postgres).
+      CELERY_WORKER_MAX_MEMORY_PER_CHILD: ${SLOW_WORKER_MAX_MEMORY_PER_CHILD:-358000}
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q slow -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=${SLOW_WORKER_CONCURRENCY:-2}
+    restart: unless-stopped
+    networks: [desi-net]
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$(hostname) --timeout=10 | grep -q pong"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    mem_limit: 1024m
+    cpus: 1.0
+
+  # Worker thứ tư cho queue `exports`. KHÔNG dùng chung `slow`: queue đó đang ôm job
+  # Gemini (soft_time_limit 300–480s) và precompute báo cáo (time_limit 900s) với
+  # concurrency 2 — file Excel của người dùng xếp sau một job LLM 8 phút thì việc
+  # chuyển sang chạy nền mất hết ý nghĩa.
+  worker-export:
+    build: *backend-build
+    container_name: desi-worker-export
+    environment:
+      <<: *backend-env
+      DB_APPLICATION_NAME: desi-worker-export
+      # Công thức giống worker-slow: (mem_limit 768MB - parent ~180MB) / concurrency 2
+      # * 0.85 ≈ 250MB mỗi child. Đổi EXPORT_WORKER_CONCURRENCY thì PHẢI đổi giá trị
+      # này theo, nếu không child bị cgroup OOM killer SIGKILL trước khi Celery kịp
+      # recycle → connection Postgres mồ côi chiếm slot.
+      CELERY_WORKER_MAX_MEMORY_PER_CHILD: ${EXPORT_WORKER_MAX_MEMORY_PER_CHILD:-250000}
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q exports -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=${EXPORT_WORKER_CONCURRENCY:-2}
+    restart: unless-stopped
+    # Không khai = mặc định Docker 10s. Celery nhận SIGTERM là warm shutdown (ngừng
+    # nhận task mới, CHỜ task đang chạy) nhưng job export có thể chạy tới
+    # time_limit=660s (EXPORT_SOFT_TIME_LIMIT+60) — 10s là cắt ngang gần như MỌI
+    # job đang xử lý mỗi lần recreate (deploy/scale), để lại job kẹt RUNNING +
+    # connection Postgres mồ côi (cùng lớp sự cố 2026-07-21 của worker-slow).
+    # 90s đủ cho phần lớn job export thực tế (vài giây tới vài phút) kết thúc êm
+    # mà không treo deploy cỡ time_limit đầy đủ (11 phút, không thực tế cho một
+    # bước trong `scripts/deploy-prod.sh`); job vượt quá 90s bị SIGKILL vẫn được
+    # `purge_expired_exports` cứu ở nhịp beat kế tiếp (mục 3, xem
+    # docs/runbooks/export-jobs.md mục 2) — đây là lưới đỡ thứ hai, không phải
+    # điểm chặn duy nhất.
+    stop_grace_period: 90s
+    networks: [desi-net]
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$(hostname) --timeout=10 | grep -q pong"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    mem_limit: 768m
+    cpus: 1.0
+
+  # ──────────────────────── Celery worker Foxia ──────────────────────────
+  # Container RIÊNG cho Foxia (spec 2026-09-09). Nghe hai queue:
+  #   foxia      — backfill/đồng bộ dữ liệu từ CRM đối tác (sync_catalog,
+  #                sync_orders, sync_delivered), time_limit 900s, chạy hàng
+  #                chục phút. Container này KẾ THỪA nguyên queue `foxia` từ
+  #                worker-slow (xem comment ở service đó) — cùng job, cùng
+  #                concurrency 2 — nên PHẢI giữ nguyên bao bọc bộ nhớ của
+  #                worker-slow: mem_limit 1024m + công thức recycle RSS
+  #                (1024MB - parent ~180MB) / concurrency 2 * 0.85 ≈ 358MB
+  #                mỗi child. Đặt 512m ở đây (như foxia_push một mình cần) mà
+  #                giữ nguyên ngưỡng recycle 180000 mặc định của anchor (tính
+  #                cho container 1024MB) là lặp lại đúng lỗi cgroup OOM killer
+  #                đã ghi trong comment worker-slow/worker-export.
+  #   foxia_push — đẩy đơn landing sang Foxia, mỗi job chỉ một request HTTP
+  #                ngắn — không cần bộ nhớ riêng, đi ké bao bọc của `foxia`.
+  # Tách container riêng (khỏi worker-slow) vì chiều đẩy đơn (foxia_push)
+  # không được xếp hàng sau CẢ job Gemini 8 phút của queue `slow` LẪN sau
+  # chính job backfill 900s của `foxia`.
+  # Concurrency mặc định 1, KHÔNG PHẢI 2 (ruling controller, review 2026-09-09
+  # mục I6): host chỉ còn ~2.2GB khả dụng + 2.5GB swap đã dùng trên 31 container.
+  # Trước đây `foxia` CHIA hai slot với job của `worker-slow`, chưa từng SỞ HỮU
+  # nguyên hai slot riêng; `foxia_push` chỉ là một request HTTP ngắn. Không có
+  # lý do để container mới này giữ nguyên 2 slot + 2048m tổng cộng (2 ở đây +
+  # 1024m cũ ở `worker-slow`) cho cùng một khối lượng việc trước kia chỉ có 2
+  # slot / 1024m. mem_limit và CELERY_WORKER_MAX_MEMORY_PER_CHILD giữ NGUYÊN
+  # (xem comment ở khối environment bên dưới) — chỉ concurrency đổi.
+  worker-foxia:
+    build: *backend-build
+    container_name: desi-worker-foxia
+    environment:
+      <<: *backend-env
+      DB_APPLICATION_NAME: desi-worker-foxia
+      # Ngưỡng recycle RSS phải tính lại vì container này kế thừa job backfill
+      # `foxia` (900s) từ worker-slow, lịch sử ở concurrency 2 — không thể dùng
+      # 180000 mặc định của anchor *backend-env (giá trị đó tính cho worker
+      # `default` concurrency 4). Công thức + giá trị giống hệt worker-slow:
+      #   (mem_limit 1024MB - parent ~180MB) / concurrency 2 * 0.85 ≈ 358MB
+      #   ≈ 358000KB mỗi child.
+      # Từ 2026-09-09 (ruling I6) concurrency MẶC ĐỊNH hạ còn 1, nhưng ngưỡng
+      # này CỐ Ý giữ nguyên tính theo concurrency 2 — an toàn hơn (recycle sớm
+      # hơn mức cần) chứ không sai, và tránh phải theo dõi hai biến env đồng bộ
+      # nhau cho một service ít quan trọng. Đổi FOXIA_WORKER_CONCURRENCY LÊN
+      # (vượt 2) thì PHẢI đổi giá trị này theo, nếu không child sẽ bị cgroup OOM
+      # killer SIGKILL trước khi Celery kịp recycle → connection Postgres mồ côi
+      # chiếm slot (xem comment service postgres).
+      CELERY_WORKER_MAX_MEMORY_PER_CHILD: ${FOXIA_WORKER_MAX_MEMORY_PER_CHILD:-358000}
+    depends_on:
+      web: { condition: service_started }
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /tmp/prom_multiproc
+        exec celery -A config worker -Q foxia,foxia_push -l ${DJANGO_LOG_LEVEL:-INFO} --concurrency=${FOXIA_WORKER_CONCURRENCY:-1}
+    restart: unless-stopped
+    networks: [desi-net]
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$(hostname) --timeout=10 | grep -q pong"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    mem_limit: 1024m
+    cpus: 1.0
+
+  beat:
+    build: *backend-build
+    container_name: desi-beat
+    environment:
+      <<: *backend-env
+      DB_APPLICATION_NAME: desi-beat
+    depends_on:
+      # service_healthy: web chạy migrate trước khi healthy → bảng django_celery_beat
+      # đã sẵn sàng khi beat start (DatabaseScheduler cần schema trong DB).
+      web: { condition: service_healthy }
+    # DatabaseScheduler (audit 7.5): lịch lưu trong Postgres thay vì file /tmp
+    # (mất khi container recreate). CELERY_BEAT_SCHEDULE code-defined vẫn được
+    # sync vào DB mỗi lần beat start (setup_schedule → update_from_dict).
+    command:
+      - sh
+      - -c
+      - "mkdir -p /tmp/prom_multiproc && exec celery -A config beat -l ${DJANGO_LOG_LEVEL:-INFO} --scheduler django_celery_beat.schedulers:DatabaseScheduler --pidfile=/tmp/celerybeat.pid"
+    restart: unless-stopped
+    networks: [desi-net]
+    healthcheck:
+      # Beat không có cơ chế ping; kiểm tra tối thiểu là pidfile đã được tạo
+      # (beat đã khởi động). Liveness sâu hơn cần 1 task heartbeat định kỳ.
+      test: ["CMD-SHELL", "test -f /tmp/celerybeat.pid"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    mem_limit: 200m
+    cpus: 0.3
+
+  # ───────────────────────── APP — Frontend ─────────────────────────
+  # Container chứa nginx serve React build (port 80 internal). Host nginx
+  # proxy / + /assets/ → 127.0.0.1:8001.
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: desi-frontend
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["80"]
+    ports:
+      - "127.0.0.1:8001:80"     # host nginx → frontend
+
+  # ────────────────────────── MONITORING (--profile monitoring) ──────────────
+  prometheus:
+    # Pin 2026-07-03: v3.13.0 = LTS line hiện hành (3.5 LTS EOL 07/2026).
+    image: prom/prometheus:v3.13.0
+    container_name: desi-prometheus
+    profiles: ["monitoring"]
+    volumes:
+      - ./monitoring/prometheus.full.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROM_RETENTION:-30d}"
+      - "--web.enable-lifecycle"
+    ports:
+      # Chỉ để debug/reload từ host — Grafana gọi qua container DNS. Host prod
+      # có service khác chiếm 9090 (desi-ads-crm-backend) nên port đổi được
+      # bằng PROM_HOST_PORT trong .env.
+      - "127.0.0.1:${PROM_HOST_PORT:-9090}:9090"
+    restart: unless-stopped
+    networks: [desi-net]
+
+  # Nhận alert từ Prometheus rồi đẩy sang service lark-alert-adapter (bên dưới).
+  # Trước đây entrypoint sed thay URL noop bằng LARK_ALERT_WEBHOOK_URL để trỏ
+  # THẲNG bot Lark — cách đó không chạy được: payload của Alertmanager không phải
+  # định dạng Lark nhận, bot từ chối và alert im lặng biến mất. Nay URL bot nằm ở
+  # adapter, alertmanager.yml trỏ cố định vào adapter nên không cần sed nữa.
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: desi-alertmanager
+    profiles: ["monitoring"]
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    ports:
+      - "127.0.0.1:9093:9093"
+    mem_limit: 128m
+    restart: unless-stopped
+    networks: [desi-net]
+
+  # Chuyển payload Alertmanager → định dạng Lark custom bot. Chỉ dùng thư viện
+  # chuẩn nên chạy thẳng trên python-slim, không cần build image.
+  # LARK_ALERT_WEBHOOK_URL trống → adapter chạy NOOP và in alert ra log (xem
+  # `docker logs desi-lark-alert-adapter`), KHÔNG làm alertmanager lỗi.
+  lark-alert-adapter:
+    image: public.ecr.aws/docker/library/python:3.13-slim
+    container_name: desi-lark-alert-adapter
+    profiles: ["monitoring"]
+    environment:
+      LARK_ALERT_WEBHOOK_URL: ${LARK_ALERT_WEBHOOK_URL:-}
+    volumes:
+      - ./monitoring/lark_alert_adapter.py:/app/lark_alert_adapter.py:ro
+    command: ["python", "/app/lark_alert_adapter.py"]
+    expose: ["9095"]
+    mem_limit: 128m
+    restart: unless-stopped
+    networks: [desi-net]
+
+  # Queue length Celery cho rule CeleryQueueBacklog (trỏ Redis broker DB 3 —
+  # khớp REDIS_CELERY_BROKER_DB của app; cấu hình gốc: monitoring/docker-compose.yml).
+  celery-exporter:
+    image: danihodovic/celery-exporter:0.12.2  # pin 2026-07-03
+    container_name: desi-celery-exporter
+    profiles: ["monitoring"]
+    environment:
+      CE_BROKER_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379/3"
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["9808"]
+    mem_limit: 128m
+
+  grafana:
+    # Pin 2026-07-03: 13.0.x supported tới 01/2027.
+    image: grafana/grafana:13.0.3
+    container_name: desi-grafana
+    profiles: ["monitoring"]
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required for the monitoring profile}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+      # Publish qua nginx host theo sub-path (vd https://erp.desiglobal.vn/grafana/):
+      # ROOT_URL phải khớp URL người dùng gõ, nếu không redirect sau login sẽ về
+      # localhost. SERVE_FROM_SUB_PATH=true ⇒ nginx KHÔNG được strip prefix
+      # (proxy_pass không có dấu / ở cuối). Xem nginx/grafana-subpath.location.example.
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3001/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: ${GRAFANA_SERVE_FROM_SUB_PATH:-false}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3001:3000"
+    restart: unless-stopped
+    networks: [desi-net]
+
+  # ──────────────── Log tập trung: Loki + Alloy (--profile monitoring) ────────────
+  # Alloy tail log MỌI container docker trên host (qua docker.sock read-only) và
+  # đẩy vào Loki; xem log trong Grafana (datasource Loki, provisioning sẵn).
+  # Backend nên bật LOG_FORMAT=json để query theo request_id. Retention 14d
+  # (monitoring/loki-config.yml). Chi tiết: docs/ops-hardening-2026-07.md.
+  loki:
+    # Pin 2026-07-18: line 3.5.x. Nếu tag không pull được, lấy patch mới nhất 3.5.*.
+    image: grafana/loki:3.5.2
+    container_name: desi-loki
+    profiles: ["monitoring"]
+    command: ["-config.file=/etc/loki/config.yml"]
+    volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3100/ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["3100"]
+    mem_limit: 512m
+    cpus: 0.5
+
+  alloy:
+    # Pin 2026-07-18: line v1.x. Nếu tag không pull được, lấy patch mới nhất v1.*.
+    image: grafana/alloy:v1.10.2
+    container_name: desi-alloy
+    profiles: ["monitoring"]
+    depends_on:
+      loki: { condition: service_started }
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+    volumes:
+      - ./monitoring/alloy-config.alloy:/etc/alloy/config.alloy:ro
+      # Đọc log + discover container qua docker.sock (read-only).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["12345"]
+    mem_limit: 256m
+    cpus: 0.5
+
+  node-exporter:
+    # Pin 2026-07-03 (release 04/2026).
+    image: prom/node-exporter:v1.11.1
+    container_name: desi-node-exporter
+    profiles: ["monitoring"]
+    command:
+      - "--path.rootfs=/host"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+      # Textfile metrics (desi-backup.sh ghi desi_backup_last_success_timestamp).
+      - "--collector.textfile.directory=/var/lib/node_exporter/textfile"
+    volumes:
+      - /:/host:ro,rslave
+      - /var/lib/node_exporter/textfile:/var/lib/node_exporter/textfile:ro
+    restart: unless-stopped
+    networks: [desi-net]
+    pid: host
+    expose: ["9100"]
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: desi-cadvisor
+    profiles: ["monitoring"]
+    privileged: true
+    devices: ["/dev/kmsg"]
+    # Host chạy Docker với containerd snapshotter (storage driver "overlayfs"):
+    # đường image/overlayfs/layerdb không tồn tại nên cadvisor fail "identify
+    # the read-write layer ID" cho TỪNG container và bỏ rơi tất cả — metric chỉ
+    # còn cgroup gốc, không có nhãn name, alert ContainerOOMKill mù suốt từ khi
+    # bật monitoring (lộ ra khi điều tra sự cố 2026-08-03 13:46). Việc tra layer
+    # ID chỉ phục vụ metric disk usage → allowlist bỏ "disk" để cadvisor bỏ qua
+    # bước đó; RAM/CPU/network/OOM (thứ các alert cần) giữ nguyên.
+    command:
+      - --enable_metrics=cpu,memory,network,diskIO,oom_event
+      - --docker_only=true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["8080"]
+
+  postgres-exporter:
+    # Pin 2026-07-03 (release 02/2026).
+    image: prometheuscommunity/postgres-exporter:v0.19.1
+    container_name: desi-postgres-exporter
+    profiles: ["monitoring"]
+    environment:
+      # application_name: exporter mở 2 connection (auto-discover databases) và trước
+      # đây hiện ra là dòng RỖNG trong pg_stat_activity — đúng loại nhiễu đã ngốn 4
+      # vòng điều tra sự cố 2026-07-23 và làm mất thời gian lại ở 2026-07-29.
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-desi}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-desi}?sslmode=disable&application_name=desi-pg-exporter"
+      # TẮT auto-discover (đo pg_stat_statements 2026-08-11): bật lên nghĩa là
+      # exporter nối tới MỌI database của server và chạy MỌI collector trên từng
+      # cái — mà host này dùng chung với ads-crm, nên ta đang đốt CPU của Postgres
+      # để đo database của hệ thống khác. Riêng `pg_database_size` đã 414.724 lần
+      # gọi. Chỉ cần metric của DB `desi`, đúng cái DATA_SOURCE_NAME đang trỏ tới.
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "false"
+    # Collector stat_statements TẮT mặc định — phải bật tường minh (audit C1). Chỉ
+    # có metric sau khi đã `CREATE EXTENSION pg_stat_statements` trong DB; trước đó
+    # collector báo lỗi êm và không sinh metric nào.
+    #
+    # `stat_user_tables` TẮT (đo 2026-08-11): câu nó chạy mỗi lần scrape là câu
+    # NGỐN NHIỀU THỜI GIAN DB NHẤT toàn hệ thống — 19% tổng `total_exec_time`,
+    # 103.681 lần × 194ms ≈ 5,6 giờ CPU-DB. Đắt vì `stock_movements` đã partition
+    # nên pg_stat_user_tables phình theo số partition. Đã đối chiếu
+    # `monitoring/alerts.yml`: KHÔNG alert nào dùng `pg_stat_user_tables_*`
+    # (chỉ pg_up, pg_stat_activity_count, pg_settings_max_connections,
+    # pg_stat_database_deadlocks, pg_stat_statements) nên tắt không mất cảnh báo.
+    # Cần số seq_scan/idx_scan để điều tra thì đọc trực tiếp bằng
+    # `scripts/perf/pg-index-usage.sql`, không cần scrape 4 lần/phút.
+    #
+    # KHÔNG hạ scrape_interval của job này để "tiết kiệm" — alert
+    # PostgresConnectionSpike đọc `pg_stat_activity_count` (gauge, for: 0m) và đã
+    # có tiền lệ bão connection kéo 10 giây tàng hình với chu kỳ scrape dài
+    # (sự cố 2026-07-23). Cắt đúng collector đắt tiền, giữ nguyên nhịp đo.
+    command:
+      - "--collector.stat_statements"
+      - "--no-collector.stat_user_tables"
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["9187"]
+
+  # ──────────────────────── Redis cache (instance RIÊNG) ─────────────────────
+  # Tách khỏi `redis` (broker + channels) — audit cache/latency 2026-08-11 §2.1.
+  #
+  # Hai vai trò có yêu cầu NGƯỢC NHAU, không hoà giải được trên cùng một instance:
+  #   - broker: `noeviction` (mất message = mất job) + AOF (phải sống qua restart);
+  #   - cache : `allkeys-lru` (đầy thì đẩy key cũ ra) + không cần bền vững.
+  # Để chung như trước nghĩa là một đợt cache phình sẽ làm Redis từ chối MỌI lệnh
+  # ghi → Celery và WebSocket chết theo. Đó là lan sự cố, không phải chậm.
+  #
+  # KHÔNG có profile: service này phải chạy ở `up -d` thường. `scripts/deploy-prod.sh`
+  # chỉ `up` danh sách service app nên PHẢI tạo nó bằng tay MỘT LẦN trước khi
+  # deploy web/worker mang env mới:  docker compose -f docker-compose.prod.yml up -d redis-cache
+  redis-cache:
+    image: public.ecr.aws/docker/library/redis:7-alpine
+    container_name: desi-redis-cache
+    # Chạy qua sh -c để $REDIS_PASSWORD được shell expand (cùng lý do như service
+    # `redis` bên dưới: redis-server không phải shell, không tự giãn biến).
+    #
+    # `--save ""` tắt RDB và KHÔNG khai appendonly → tắt luôn AOF. Cache tái tạo
+    # được từ DB nên fsync nó chỉ tốn IO và làm chậm chính lệnh ghi. Đây cũng là
+    # lý do service này KHÔNG gắn volume: mất hết khi restart là đúng mong muốn.
+    command:
+      - sh
+      - -c
+      - >
+        exec redis-server
+        --requirepass "$$REDIS_PASSWORD"
+        --save ""
+        --appendonly no
+        --maxmemory ${REDIS_CACHE_MAXMEMORY:-256mb}
+        --maxmemory-policy allkeys-lru
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      desi-net:
+        aliases: [redis-cache]
+    expose: ["6379"]
+    # mem_limit phải RỘNG HƠN maxmemory: redis cần chỗ cho buffer client, replication
+    # backlog và phân mảnh allocator. Chật quá thì OOM killer ra tay TRƯỚC khi LRU
+    # kịp evict — đúng thứ việc tách instance này định tránh.
+    mem_limit: 512m
+    cpus: 0.5
+
+  # ──────────────────────── Redis (broker + channels) ────────────────────────
+  # Codify spec của redis prod (trước đây chạy như container external ngoài
+  # compose → SPOF không được khai báo). Để dưới profile "managed-redis" nên
+  # KHÔNG tự khởi động ở `up -d` thường, tránh xung đột với container redis
+  # external đang chạy. Cutover sang bản này theo docs/security-sprint0-runbook.md
+  # (mục Redis): dừng container cũ, gắn cùng volume, rồi `--profile managed-redis up -d`.
+  redis:
+    image: public.ecr.aws/docker/library/redis:7-alpine
+    container_name: desi-redis-managed
+    profiles: ["managed-redis"]
+    # Chạy qua sh -c để $REDIS_PASSWORD được shell expand. Nếu để redis-server
+    # nhận trực tiếp "$${REDIS_PASSWORD}" thì password thành chuỗi literal
+    # "${REDIS_PASSWORD}" (redis-server không phải shell) -> sai mật khẩu.
+    command:
+      - sh
+      - -c
+      - >
+        exec redis-server
+        --requirepass "$$REDIS_PASSWORD"
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 512mb
+        --maxmemory-policy noeviction
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      desi-net:
+        aliases: [redis]
+    expose: ["6379"]
+    # mem_limit gấp ~2x maxmemory: fork lúc AOF rewrite copy-on-write có thể
+    # tạm thời nhân đôi RSS; đặt sát trần thì cgroup giết redis giữa lúc rewrite.
+    mem_limit: 1024m
+    cpus: 1.0
+
+  redis-exporter:
+    # Pin 2026-07-03 (release 04/2026).
+    image: oliver006/redis_exporter:v1.83.0
+    container_name: desi-redis-exporter
+    profiles: ["monitoring"]
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["9121"]
+
+  # Exporter RIÊNG cho instance cache. Một exporter chỉ scrape một REDIS_ADDR, nên
+  # thiếu service này thì `redis-cache` hoàn toàn vô hình với Prometheus —
+  # `evicted_keys` và `used_memory` của nó là hai số cần nhất để chỉnh
+  # REDIS_CACHE_MAXMEMORY (xem runbook §4).
+  redis-cache-exporter:
+    image: oliver006/redis_exporter:v1.83.0
+    container_name: desi-redis-cache-exporter
+    profiles: ["monitoring"]
+    environment:
+      REDIS_ADDR: "redis://redis-cache:6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    restart: unless-stopped
+    networks: [desi-net]
+    expose: ["9121"]
+
+  # nginx-exporter removed: SSL/reverse proxy do host nginx (systemd) đảm
+  # nhiệm. Nếu cần metrics cho host nginx, cài nginx-prometheus-exporter
+  # trực tiếp trên host hoặc thêm container scrape http://host.docker.internal/nginx_status.
+
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:
+  # Log Loki (chunks + index, retention 14d) + state Alloy (position đọc log).
+  loki_data:
+  alloy_data:
+  # Persistence cho redis service "managed-redis" (AOF). Khi cutover từ redis
+  # external, trỏ volume này tới data dir của redis cũ (xem runbook).
+  redis_data:
+  # Ảnh chấm công (MinIO). Compose tự tạo volume desi-order_minio_data.
+  minio_data:
+  # Data prod hiện hữu — KHÔNG tạo mới, tham chiếu volume external đã có
+  # 130GB+. Tên do compose project cũ sinh ra ("desi-order" + "_pg_data").
+  pg_data:
+    external: true
+    name: desi-order_pg_data
+
+networks:
+  # Reuse network của postgres + redis containers đang chạy
+  # (`desi-order_default` — Compose project name "desi-order").
+  # Dùng alias `desi-net` trong service definitions để tương thích với
+  # docker-compose.local.yml. Mọi service mới attach vào network này
+  # truy cập postgres/redis qua hostname `postgres` / `redis` (DNS từ
+  # service-name của Compose project cũ).
+  desi-net:
+    external: true
+    name: desi-order_default
+  # Mạng của project desi-crawl-conversations (compose project "deploy",
+  # container deploy-postgres-1) — cầu FDW sang DB crawler cần container
+  # postgres của TA attach vào đây (spec 2026-09-04 C1, xem service postgres).
+  deploy_default:
+    external: true

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Host không có node (vd VPS prod chỉ có docker) → bỏ qua kiểm tra encoding thay vì
+# ép mọi commit dùng --no-verify; CI (frontend:lint) vẫn chạy cùng script.
+if ! command -v node >/dev/null 2>&1; then
+  echo "[pre-commit] node không có trên máy — bỏ qua fix-mojibake/check-encoding (CI sẽ kiểm)." >&2
+  exit 0
+fi
+
+node scripts/fix-mojibake.js frontend/src/pages README.md
+node scripts/check-encoding.js

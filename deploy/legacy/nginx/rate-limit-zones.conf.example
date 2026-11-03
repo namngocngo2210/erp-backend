@@ -1,0 +1,57 @@
+# Rate limiting zones — dành cho HOST nginx (prod/staging chạy nginx systemd,
+# không phải nginx container).
+#
+# Cài đặt:
+#   sudo cp nginx/rate-limit-zones.conf.example /etc/nginx/conf.d/00-rate-limit-zones.conf
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Vì sao là file riêng: `limit_req_zone` và `map` CHỈ hợp lệ trong block `http`,
+# còn vhost (`sites-enabled/customer.delax.vn`) nằm trong block `server`. Tiền tố
+# `00-` để nginx đọc file này TRƯỚC các vhost tham chiếu tới zone.
+#
+# Vhost tương ứng dùng `limit_req zone=... burst=... nodelay;` — xem
+# nginx/customer.delax.vn.host.conf.example. Rollback = comment dòng `limit_req`
+# trong vhost rồi reload; không cần gỡ file này.
+#
+# Thiết kế & cơ sở chọn số: docs/rate-limiting-hardening-2026-07.md §3.1
+
+# Key giới hạn = IP client THẬT.
+#   - `CF-Connecting-IP` do Cloudflare set, client không giả được khi origin chỉ
+#     nhận traffic từ CF.
+#   - KHÔNG dùng X-Forwarded-For: client tự đặt header đó để né giới hạn.
+#   - Không có CF (gọi thẳng IP, môi trường dev) → rơi về địa chỉ TCP thật.
+map $http_cf_connecting_ip $desi_rl_key {
+    default $http_cf_connecting_ip;
+    ""      $binary_remote_addr;
+}
+
+# Toàn bộ REST API. 20 r/s DUY TRÌ cho mỗi IP: mở một trang ERP bắn ~10-20 request
+# một lúc (burst lo phần này), nhưng thao tác tay không thể giữ 20 r/s liên tục.
+# Cả văn phòng ra internet chung MỘT IP NAT nên không đặt thấp hơn.
+# 10m ≈ 160k IP đang theo dõi — thừa sức cho lưu lượng thật.
+limit_req_zone $desi_rl_key zone=desi_api_general:10m rate=20r/s;
+
+# Đăng nhập + refresh token: chống brute-force. 1 r/s duy trì là quá đủ cho người
+# thật, burst 20 để 9h sáng cả công ty đăng nhập cùng lúc không bị chặn oan.
+limit_req_zone $desi_rl_key zone=desi_api_auth:5m rate=60r/m;
+
+# Landing ingest (máy-tới-máy, token riêng). Van chống DDoS chứ không phải trần
+# nghiệp vụ — landing page đẩy đơn theo cụm nên phải rộng.
+limit_req_zone $desi_rl_key zone=desi_api_ingest:5m rate=30r/s;
+
+# Portal tra cứu bảo hành công khai (tra-cuu.delax.asia — không đăng nhập).
+# 10 r/m siết chặt vì đây là API public không throttle theo user: chặn dò mã
+# hàng loạt (brute-force serial/code) trong khi vẫn đủ cho khách thật tra cứu.
+limit_req_zone $desi_rl_key zone=desi_portal:10m rate=10r/m;
+
+# Ảnh sản phẩm trang /sp/ (delax.com.vn — không đăng nhập). Zone RIÊNG, rộng
+# hơn desi_portal: một lượt xem trang sản phẩm kéo tới 8 ảnh + 1 lần gọi
+# payload = 9 request, zone desi_portal (10r/m) sẽ chặn ngay từ lượt xem đầu.
+# Endpoint chỉ đọc object bất biến theo id, không hé lộ gì về mã bảo hành nên
+# nới lỏng được.
+limit_req_zone $desi_rl_key zone=desi_portal_media:10m rate=120r/m;
+
+# Mặc định nginx trả 503 khi vượt giới hạn — đổi sang 429 cho đúng ngữ nghĩa và
+# khớp với 429 mà DRF trả ở tầng app (FE xử lý chung một nhánh).
+limit_req_status 429;
+limit_req_log_level warn;

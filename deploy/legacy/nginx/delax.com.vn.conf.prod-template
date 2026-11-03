@@ -1,0 +1,147 @@
+# Production vhost cho delax.com.vn — portal khách hàng công khai + trang sản
+# phẩm quét QR (Cloudflare Origin → nginx → web/frontend).
+#
+# ⚠️ TÁI DỰNG BEST-EFFORT: delax.com.vn ĐANG chạy thật trên prod (xác nhận
+# `GET https://delax.com.vn/bao-hanh` trả 200 với bundle frontend của repo
+# này) nhưng config sống KHÔNG nằm trong version control — file này dựng lại
+# theo đúng convention của các vhost `.conf.prod-template` khác trong thư mục
+# (gần nhất: `tra-cuu.delax.asia.conf.prod-template`, cùng là portal public,
+# tập location hẹp). Những giá trị dưới đây KHÔNG đọc được từ config thật,
+# phải người vận hành xác minh trước khi deploy — xem task-8-report.md.
+#
+# ⚠️ FILE NÀY DÙNG DNS CONTAINER (`web:8000`, `frontend:80`) — chỉ đúng khi
+# nginx chạy TRONG compose. Theo docker-compose.prod.yml, prod hiện tại chạy
+# nginx systemd trên HOST với web/frontend chỉ bind 127.0.0.1:8000/8001 (như
+# `customer.delax.vn.host.conf.example` và `tra-cuu.delax.asia.host.conf.example`)
+# — dùng `nginx/delax.com.vn.host.conf.example` cạnh file này để deploy lên
+# prod, KHÔNG dựng lại bản host-nginx từ file `.conf.prod-template` này.
+#
+# Mount (compose):
+#   - /etc/ssl/certs/delax.com.vn.pem    (Cloudflare Origin cert — ĐOÁN theo
+#     convention delax.vn.pem / delax.asia.pem, CHƯA xác minh tồn tại)
+#   - /etc/ssl/private/delax.com.vn.key
+#
+# PHỤ THUỘC: các directive `limit_req` bên dưới cần zone khai báo ở block `http`.
+# Cài trước:
+#   sudo cp nginx/rate-limit-zones.conf.example /etc/nginx/conf.d/00-rate-limit-zones.conf
+# Thiếu file đó thì `nginx -t` báo "unknown limit_req zone" và nginx KHÔNG reload
+# được — luôn `nginx -t` trước khi reload.
+#
+# CỐ Ý KHÔNG mở trên domain này: `/api/` chung, `/api/users/*`, `/ws/`,
+# `/nginx_status`. Domain khách chỉ cần portal + trang sản phẩm + API portal.
+
+server {
+  listen 80;
+  server_name delax.com.vn;
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl;
+  http2 on;
+  server_name delax.com.vn;
+
+  ssl_certificate     /etc/ssl/certs/delax.com.vn.pem;
+  ssl_certificate_key /etc/ssl/private/delax.com.vn.key;
+  ssl_protocols       TLSv1.2 TLSv1.3;
+  ssl_ciphers         HIGH:!aNULL:!MD5;
+  ssl_session_cache   shared:SSL:10m;
+  ssl_session_timeout 1d;
+
+  # ── Security headers ──
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header X-Frame-Options "SAMEORIGIN" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  server_tokens off;
+
+  client_max_body_size 12m;
+
+  # ── Nén response của upstream (audit cache/latency 2026-08-11 §2.4) ──
+  # Mặc định của nginx là `gzip_proxied off`: KHÔNG nén response đến từ
+  # proxy_pass. Vì vậy toàn bộ JSON của API đang được nén bằng zlib CỦA PYTHON
+  # trong `desi-web` — nơi chỉ có 1.5 CPU và CPU đã là nút cổ chai lúc bão.
+  #
+  # Bật dòng này CHƯA đổi gì: Django còn nén thì response đã mang sẵn
+  # `Content-Encoding` và nginx bỏ qua. Nó chỉ có tác dụng ở bước 2 của cutover —
+  # đặt WEB_GZIP_IN_DJANGO=0 rồi restart web (verify: runbook §8).
+  gzip on;
+  gzip_vary on;
+  gzip_proxied any;
+  gzip_min_length 1024;
+  gzip_comp_level 5;
+  gzip_types application/json application/javascript text/css text/plain image/svg+xml;
+
+  # Healthz endpoint cho compose healthcheck
+  location = /healthz {
+    return 200 'ok';
+    add_header Content-Type text/plain;
+  }
+
+  # Root chỉ có ý nghĩa với portal — chuyển vào bundle SPA tại /bao-hanh.
+  # PHẢI là redirect thật (302), KHÔNG dùng `rewrite ... last;`: rewrite chỉ đổi
+  # URI nội bộ trong nginx, thanh địa chỉ trình duyệt vẫn là `/` →
+  # frontend/src/main.tsx rẽ nhánh theo `window.location.pathname` sẽ không thấy
+  # `/bao-hanh` và render app CRM thay vì portal (xem cảnh báo tương tự ở
+  # `tra-cuu.delax.asia.host.conf.example`).
+  location = / {
+    return 302 /bao-hanh;
+  }
+
+  # ── Frontend assets: tên file mang content-hash nên cache 1 năm, immutable
+  # (audit cache/latency 2026-08-11 §2.5). Đổi nội dung là đổi tên file. ──
+  location /assets/ {
+    set $frontend_upstream http://frontend:80;
+    proxy_pass $frontend_upstream;
+    expires 1y;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    proxy_set_header Host $host;
+  }
+
+  # ── SPA portal tra cứu bảo hành ──
+  location /bao-hanh {
+    set $frontend_upstream http://frontend:80;
+    proxy_pass $frontend_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # ── SPA trang sản phẩm khi quét QR trên tem: https://delax.com.vn/sp/<mã> ──
+  # Mã sản phẩm nằm trong path, frontend đọc client-side (không cần rewrite).
+  location /sp/ {
+    set $frontend_upstream http://frontend:80;
+    proxy_pass $frontend_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # ── Ảnh sản phẩm trang /sp/ — zone RIÊNG rộng hơn desi_portal: một lượt xem
+  #    kéo tới 8 ảnh + 1 lần gọi payload = 9 request, zone desi_portal (10r/m
+  #    burst=10) sẽ chặn ngay từ lượt xem đầu tiên. Endpoint chỉ đọc object bất
+  #    biến theo id, không hé lộ gì về mã bảo hành nên nới lỏng được.
+  #    Prefix dài hơn nên nginx chọn location này trước location chung bên dưới
+  #    (khớp theo longest-prefix, không phụ thuộc thứ tự khai báo trong file).
+  location /api/warranty-portal/product-images/ {
+    limit_req zone=desi_portal_media burst=30 nodelay;
+    proxy_pass http://web:8000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # ── API portal public (activate/track/products) — zone rate limit RIÊNG,
+  #    chặt hơn desi_api_general vì endpoint này không đăng nhập ──
+  location /api/warranty-portal/ {
+    limit_req zone=desi_portal burst=10 nodelay;
+    proxy_pass http://web:8000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}

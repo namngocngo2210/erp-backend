@@ -1,0 +1,10 @@
+# Override máy-local (KHÔNG commit): Docker Desktop máy này chỉ cấp 2 CPU,
+# trong khi docker-compose.local.yml đặt postgres cpus=2.5 (viết cho máy dev
+# mạnh hơn). Hạ trần cho vừa; các service khác đều <= 2.0 nên giữ nguyên.
+services:
+  postgres:
+    cpus: 2.0
+  web:
+    cpus: 1.0
+  worker:
+    cpus: 1.0

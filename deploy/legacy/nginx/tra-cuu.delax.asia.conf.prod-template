@@ -1,0 +1,103 @@
+# Production vhost cho tra-cuu.delax.asia — portal tra cứu bảo hành công khai
+# (Cloudflare Origin → nginx → web/frontend).
+#
+# ⚠️ FILE NÀY DÙNG DNS CONTAINER (`web:8000`, `frontend:80`) — chỉ đúng khi nginx
+# chạy TRONG compose. Prod hiện tại chạy nginx systemd trên HOST → dùng
+# `nginx/tra-cuu.delax.asia.host.conf.example` (upstream 127.0.0.1:8000/8001).
+#
+# Copy từ
+# customer.delax.vn.conf.prod-template, thu hẹp mặt tấn công: chỉ mở đúng các
+# location portal public cần, KHÔNG mở `/api/` chung, `/ws/`, `/nginx_status`.
+#
+# Mount:
+#   - /etc/ssl/certs/delax.asia.pem   (Cloudflare Origin cert cho *.delax.asia)
+#   - /etc/ssl/private/delax.asia.key
+#
+# ⚠️ VẬN HÀNH PHẢI CHUẨN BỊ TRƯỚC KHI BẬT DOMAIN NÀY: zone `.asia` KHÁC zone
+# `.vn` — chứng chỉ Cloudflare Origin hiện có trên máy chủ chỉ cấp cho
+# `delax.vn`, KHÔNG dùng được cho `delax.asia`. Phải tạo Cloudflare Origin
+# Certificate riêng cho `*.delax.asia` rồi cài đúng 2 đường dẫn ở trên trước —
+# thiếu cert thì `nginx -t` fail và domain này không thể bật (xem
+# docs/warranty-portal-design.md §9).
+#
+# Compose nginx service set ports 80 + 443 ra host. Cloudflare proxy mode
+# Full (strict) — TLS giữa Cloudflare và nginx này.
+#
+# PHỤ THUỘC: các directive `limit_req` bên dưới cần zone khai báo ở block `http`.
+# Cài trước:
+#   sudo cp nginx/rate-limit-zones.conf.example /etc/nginx/conf.d/00-rate-limit-zones.conf
+# Thiếu file đó thì `nginx -t` báo "unknown limit_req zone" và nginx KHÔNG reload
+# được — luôn `nginx -t` trước khi reload.
+
+server {
+  listen 80;
+  server_name tra-cuu.delax.asia;
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl;
+  http2 on;
+  server_name tra-cuu.delax.asia;
+
+  # Cloudflare Origin Certificate cho *.delax.asia — KHÔNG dùng chung cert
+  # delax.vn (zone khác nhau). Xem cảnh báo vận hành ở đầu file.
+  ssl_certificate     /etc/ssl/certs/delax.asia.pem;
+  ssl_certificate_key /etc/ssl/private/delax.asia.key;
+  ssl_protocols       TLSv1.2 TLSv1.3;
+  ssl_ciphers         HIGH:!aNULL:!MD5;
+  ssl_session_cache   shared:SSL:10m;
+  ssl_session_timeout 1d;
+
+  # ── Security headers ──
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header X-Frame-Options "SAMEORIGIN" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  server_tokens off;
+
+  client_max_body_size 12m;
+
+  # Healthz endpoint cho compose healthcheck
+  location = /healthz {
+    return 200 'ok';
+    add_header Content-Type text/plain;
+  }
+
+  # Root chỉ có ý nghĩa với portal — chuyển thẳng vào bundle SPA tại /bao-hanh
+  # (frontend/src/main.tsx rẽ nhánh theo path, xem §5.1 design doc).
+  location = / {
+    rewrite ^ /bao-hanh last;
+  }
+
+  # ── Frontend assets: tên file mang content-hash nên cache 1 năm, immutable
+  # (audit cache/latency 2026-08-11 §2.5). Đổi nội dung là đổi tên file. ──
+  location /assets/ {
+    set $frontend_upstream http://frontend:80;
+    proxy_pass $frontend_upstream;
+    expires 1y;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    proxy_set_header Host $host;
+  }
+
+  # ── SPA portal tra cứu bảo hành ──
+  location /bao-hanh {
+    set $frontend_upstream http://frontend:80;
+    proxy_pass $frontend_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # ── API portal public (activate/orders/journey) — zone rate limit RIÊNG,
+  #    chặt hơn desi_api_general vì endpoint này không đăng nhập ──
+  location /api/warranty-portal/ {
+    limit_req zone=desi_portal burst=10 nodelay;
+    proxy_pass http://web:8000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}

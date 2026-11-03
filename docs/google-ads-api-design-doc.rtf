@@ -1,0 +1,121 @@
+{\rtf1\ansi\ansicpg1252\deff0
+{\fonttbl{\f0\fswiss Calibri;}{\f1\fmodern Consolas;}}
+\f0\fs22
+
+{\fs36\b Google Ads API Integration \line Design Documentation\b0}\par
+\par
+{\b Tool name:} Internal Advertising Cost Reporting Module\par
+{\b Part of:} Internal Order \&amp; Revenue Management System (company-internal use)\par
+{\b Access type requested:} Basic access \endash  read-only reporting\par
+{\b Document version:} 1.0\par
+\par
+\brdrb\brdrs\brdrw10\brsp20 \par
+
+{\fs28\b 1. Overview\b0}\par
+\par
+This tool is an internal, server-side module of our company\rquote s in-house order and revenue
+management system. Its only purpose is to automatically retrieve daily advertising cost and
+performance metrics from Google Ads and store them in our internal database, so our finance
+and operations teams can compare advertising spend against sales revenue without manually
+exporting reports from the Google Ads user interface.\par
+\par
+The tool is {\b read-only}. It does not create, edit, pause, or delete any campaigns, ads,
+keywords, budgets, bids, or audiences. It performs reporting queries only. The tool is used
+internally by our own staff and is {\b not} offered to third parties or resold.\par
+\par
+
+{\fs28\b 2. Business model\b0}\par
+\par
+Our company is a retail / e-commerce business in Vietnam selling consumer products directly to
+customers through online channels. We use Google Ads (Search, Performance Max, Display,
+Shopping, and Video campaigns) to drive traffic and generate sales. We manage multiple
+advertising accounts under a single Manager (MCC) account.\par
+\par
+
+{\fs28\b 3. System architecture\b0}\par
+\par
+{\b Backend:} Python 3.13 / Django. Uses the official Google Ads Python client library
+(google-ads, gRPC) to query the Google Ads API.\par
+{\b Frontend:} React (TypeScript) single-page admin interface.\par
+{\b Database:} PostgreSQL \endash  stores the list of managed accounts and daily cost metrics.\par
+{\b Background jobs:} Celery scheduled tasks periodically refresh the daily spend data.\par
+\par
+{\b High-level data flow:}\par
+\par
+{\pard\li360 1. An administrator enters the MCC credentials once (Developer Token, OAuth2
+Client ID, Client Secret, Refresh Token, Login Customer ID). Credentials are stored
+server-side and are only accessible to administrators.\par
+2. \ldblquote Sync Accounts\rdblquote : the tool lists the advertising accounts managed under the MCC.\par
+3. \ldblquote Sync Daily Spend\rdblquote : the tool retrieves daily cost, impressions, and clicks for each
+managed account and upserts them into PostgreSQL.\par
+4. Internal users view advertising cost alongside order/revenue data in dashboards.\par
+\par}
+
+{\fs28\b 4. Authentication\b0}\par
+\par
+The tool authenticates to the Google Ads API using the standard OAuth2 flow with a long-lived
+refresh token, combined with the MCC Developer Token.\par
+\par
+{\b OAuth scope used:} https://www.googleapis.com/auth/adwords\par
+{\b Login customer ID:} the 10-digit Manager (MCC) account ID.\par
+\par
+
+{\fs28\b 5. API usage detail\b0}\par
+\par
+The tool uses only {\b GoogleAdsService.Search} (read-only GAQL SELECT queries). No mutate
+or write operations of any kind are performed.\par
+\par
+{\b Query 1 \endash  list managed accounts:}\par
+{\pard\li360\f1\fs20
+SELECT customer_client.id, customer_client.descriptive_name,\line
+\tab customer_client.currency_code, customer_client.status,\line
+\tab customer_client.manager, customer_client.level\line
+FROM customer_client\line
+WHERE customer_client.level <= 1\par
+\par}
+{\b Query 2 \endash  daily cost and performance:}\par
+{\pard\li360\f1\fs20
+SELECT segments.date, metrics.cost_micros,\line
+\tab metrics.impressions, metrics.clicks\line
+FROM customer\line
+WHERE segments.date BETWEEN '<start>' AND '<end>'\par
+\par}
+Cost is returned by Google in micros and divided by 1,000,000 to obtain the real amount.
+Date inputs are strictly validated (canonical YYYY-MM-DD) before being used in queries to
+prevent GAQL injection.\par
+\par
+
+{\fs28\b 6. Campaign types and capabilities\b0}\par
+\par
+{\b Campaign types covered (reporting):} Search, Performance Max, Display, Shopping, Video.\par
+{\b Capability provided:} Reporting only (cost and performance retrieval). The tool provides
+no campaign management, bid management, ad/creative management, keyword management,
+budget management, conversion upload, or remarketing functionality.\par
+\par
+
+{\fs28\b 7. Data security and privacy\b0}\par
+\par
+{\pard\li360
+\bullet  All API credentials are stored server-side and restricted to administrator users.\par
+\bullet  Access to the configuration interface is role-protected (admin only).\par
+\bullet  The tool retrieves only aggregated account-level cost and performance figures. It does
+not collect or process end-user personal data.\par
+\bullet  Data is used strictly for internal financial reporting and is never resold or shared with
+third parties.\par
+\bullet  All communication with the Google Ads API uses encrypted gRPC over TLS.\par
+\par}
+
+{\fs28\b 8. User interface (screens)\b0}\par
+\par
+{\pard\li360
+\bullet  {\b Configuration screen:} administrators add/edit MCC credentials.\par
+\bullet  {\b Accounts table:} displays the managed accounts synced from the MCC (name, customer
+ID, currency, status, last sync time).\par
+\bullet  {\b Daily spend view:} shows cost, impressions, and clicks per account per day for internal
+reporting.\par
+\par}
+\par
+\brdrb\brdrs\brdrw10\brsp20 \par
+{\i This tool is for internal company use only. It performs read-only reporting and does not
+modify any Google Ads entity.}\par
+}

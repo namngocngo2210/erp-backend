@@ -1,0 +1,47 @@
+# Secrets & env — NEVER copy into image
+.env
+.env.*
+!.env.example
+
+# Python caches / virtualenv
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Collected/static & build artifacts (regenerated in-container)
+staticfiles/
+media/
+
+# DB / data dumps — must never enter the image
+*.dump
+*.rdb
+*.sql
+backup/
+
+# Celery runtime
+celerybeat-schedule
+celerybeat-schedule-*
+
+# VCS / tooling
+.git
+.gitignore
+Dockerfile
+.dockerignore
+
+# Tests (not needed in runtime image)
+**/tests/
+**/test_*.py
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.log

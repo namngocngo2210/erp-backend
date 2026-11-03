@@ -1,0 +1,357 @@
+[importlinter]
+root_packages =
+    apps
+# Cần cho contract `forbidden` bắt package ngoài (django/rest_framework/celery) ở
+# apps.*.domain — audit 2026-09-23 T3/P2-2. Không đổi kết quả contract layers.
+include_external_packages = True
+# Import trong `if TYPE_CHECKING:` chỉ phục vụ type hint — không tính là phụ thuộc runtime.
+exclude_type_checking_imports = True
+
+# Contract phân tầng (audit 2026-07 mục 4.3). Tầng TRÊN được import tầng DƯỚI,
+# không có chiều ngược lại; các app cùng tầng độc lập với nhau.
+#
+# ĐỌC KỸ TRƯỚC KHI THÊM DÒNG VÀO `ignore_imports`:
+# Danh sách miễn trừ chia làm HAI KHỐI có ý nghĩa khác hẳn nhau.
+#   • KHỐI A — NGOẠI LỆ VĨNH VIỄN: đúng bản chất phải vượt tầng. KHÔNG phải nợ,
+#     không bao giờ phải trả. Thêm vào đây cần lý do rõ ràng trong MR.
+#   • KHỐI B — NỢ PHẢI TRẢ: vi phạm kiến trúc thật, đang trả dần theo lô.
+#     Khối này CHỈ ĐƯỢC GIẢM. Thêm dòng mới vào đây = tạo nợ mới, phải bị chặn
+#     ở review.
+# Lộ trình trả nợ: docs/import-layering-debt-paydown-2026-08.md
+[importlinter:contract:layers]
+name = App layering
+type = layers
+# Entry miễn trừ không còn khớp vi phạm nào sẽ làm contract FAIL. Nhờ vậy khi một
+# lô trả nợ xong mà quên xoá dòng tương ứng, lint báo ngay thay vì để danh sách
+# phình ra toàn xác chết — đúng lớp lỗi đã che entry `orders.models -> kiotviet.models`
+# suốt nhiều tuần dù import đó đã là rác.
+unmatched_ignore_imports_alerting = error
+# ⚠️ AUDIT 2026-08-19 (N3): delimiter cũ là `:` — trong import-linter đó là
+# non-INdependent (các app cùng dòng import nhau TỰ DO), ngược hẳn với chú thích
+# "độc lập với nhau" ở đầu file. Đổi sang `|` (independent thật) làm lộ toàn bộ
+# import ngang hàng — chúng được ghi nợ ở B-Lô6 bên dưới.
+# `containers` + `exhaustive`: app mới không khai tầng → contract FAIL ngay,
+# không còn vùng vô hình (trước đây 7 app nằm ngoài contract).
+containers =
+    apps
+exhaustive = true
+layers =
+    daily_report | conversion_feed
+    ai_mart
+    analytics
+    callcenter | contact_flow | warranty_codes
+    warranty
+    pancake
+    kiotviet | facebook_ads | google_ads | best_express | cnv_loyalty | foxia | media | pancake_pos
+    customers | orders | inventory | hr
+    catalog
+    warehouses
+    exports
+    audit | dispatch
+    sysconfig
+    users | channels_core
+    common
+ignore_imports =
+    # ═══════════════════════════════════════════════════════════════════════
+    # KHỐI A — NGOẠI LỆ VĨNH VIỄN (66 entry, đếm lại 2026-09-25). Không phải nợ.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # A1. Test dựng fixture bằng model của app khác (52 entry, đếm lại 2026-09-23).
+    #     Không tạo coupling lúc chạy production — đây là test setup. Quyết định
+    #     có chủ đích: không refactor, xem §6 của tài liệu lộ trình.
+    # 2026-08-20 (tách catalog): PriceBook move sang apps.catalog — test dựng
+    # fixture bảng giá nên đích đổi orders.models → catalog.models, cùng bản chất.
+    apps.channels_core.tests.test_channel_model_api -> apps.catalog.models
+    apps.channels_core.tests.test_kiotviet_channel_branch_map -> apps.kiotviet.models
+    apps.common.tests.test_throttling -> apps.users.views
+    apps.common.tests.test_throttling -> apps.warranty.views
+    # Cột "Kênh KiotViet" trong file Excel Lịch sử nhập xuất: production đọc qua
+    # join ORM `kiotviet_channel__name` (không import), riêng test phải dựng
+    # KiotVietChannel thật để gắn vào đơn.
+    apps.inventory.tests.test_inventory_export_definitions -> apps.kiotviet.models
+    apps.inventory.tests.test_pending_scan_match -> apps.kiotviet.application.services.cancellation_verifier
+    apps.inventory.tests.test_return_order_sync -> apps.kiotviet.models
+    apps.orders.tests.test_ads_reports -> apps.facebook_ads.models
+    # Nửa "phía orders" của vòng đời đơn xuất sau (xem docstring đầu file test):
+    # dựng KiotVietChannel để gọi action quick_sale_deferred_selected — cùng khuôn
+    # với test_order_create_api/test_kship_* bên dưới.
+    apps.orders.tests.test_quick_sale_invoice_only -> apps.kiotviet.models
+    # Vòng đời đơn bán trực tiếp (shipping_type=direct) cần dựng KiotVietChannel để
+    # tạo Order hợp lệ — cùng khuôn với test_order_create_api/test_kship_* bên dưới.
+    apps.orders.tests.test_direct_sale_shipping_type -> apps.kiotviet.models
+    apps.orders.tests.test_dispatch_cancelled_guard -> apps.kiotviet.application.services.cancellation_verifier
+    # Test wiring của port PHẢI chạm kiểu gốc phía kiotviet để chứng minh adapter
+    # dịch đúng (`CancelCheck` → `CancelVerdict`). Lọt vào master ở MR !1166 vì
+    # lint chạy TRƯỚC khi viết test rồi không chạy lại; khai ở đây, không phải nợ.
+    apps.orders.tests.test_kiotviet_port_wiring -> apps.kiotviet.application.services.cancellation_verifier
+    apps.orders.tests.test_kship_duplicate_guard -> apps.kiotviet.models
+    apps.orders.tests.test_kship_sender_address -> apps.kiotviet.models
+    apps.orders.tests.test_kship_shipper_note -> apps.kiotviet.models
+    apps.orders.tests.test_order_create_api -> apps.kiotviet.models
+    apps.orders.tests.test_overview_report -> apps.facebook_ads.models
+    apps.orders.tests.test_overview_report -> apps.google_ads.models
+    apps.orders.tests.test_shipping_lookup -> apps.kiotviet.application.services.cancellation_verifier
+    apps.orders.tests.test_shipping_lookup -> apps.kiotviet.models
+    apps.users.tests.test_command_guards -> apps.audit.models
+    apps.users.tests.test_command_guards -> apps.best_express.models
+    apps.users.tests.test_command_guards -> apps.facebook_ads.models
+    apps.users.tests.test_command_guards -> apps.google_ads.models
+    apps.users.tests.test_command_guards -> apps.kiotviet.models
+    apps.users.tests.test_users_list_queries -> apps.kiotviet.models
+
+    # A1b. Bổ sung 2026-08-19: đổi delimiter `:`→`|` làm lộ import fixture giữa
+    #     app CÙNG TẦNG (trước đây vô hình). Cùng bản chất A1 — test setup, không
+    #     phải coupling production. Dùng wildcard theo app nguồn để không phình
+    #     file mỗi khi thêm một test mới cùng loại (27 entry).
+    apps.audit.tests.* -> apps.exports.application.registry
+    apps.channels_core.tests.* -> apps.users.constants
+    apps.channels_core.tests.* -> apps.users.models
+    apps.channels_core.tests.* -> apps.users.tests.helpers
+    apps.common.tests.* -> apps.audit.middleware_impl
+    # 2026-09-19 (system-settings-db): test đối chứng khóa secret của registry
+    # PHẢI bị AuditLogMiddleware nhận diện là nhạy cảm (không lưu plaintext vào
+    # audit_logs.curl_command) — cùng bản chất A1/A1b, test setup không phải
+    # coupling production.
+    apps.sysconfig.tests.test_registry_contents -> apps.audit.middleware_impl
+    apps.customers.tests.* -> apps.orders.models
+    apps.foxia.tests.* -> apps.cnv_loyalty.subscribers
+    apps.foxia.tests.* -> apps.facebook_ads.models
+    apps.inventory.tests.* -> apps.customers.models
+    apps.inventory.tests.* -> apps.orders.contracts.order_events
+    apps.inventory.tests.* -> apps.orders.infrastructure.lark_notifier
+    apps.inventory.tests.* -> apps.orders.infrastructure.tasks.order_tasks_impl.lark_notification_tasks
+    apps.inventory.tests.* -> apps.orders.models
+    apps.inventory.tests.* -> apps.orders.application.services.order_service_impl
+    apps.orders.tests.* -> apps.callcenter.models
+    apps.orders.tests.* -> apps.contact_flow.models
+    apps.orders.tests.* -> apps.customers.customer_resale_service
+    apps.orders.tests.* -> apps.customers.models
+    apps.orders.tests.* -> apps.customers.services
+    apps.orders.tests.* -> apps.inventory.application.services.return_entry_service
+    apps.orders.tests.* -> apps.inventory.application.services.stock_command_service
+    apps.orders.tests.* -> apps.inventory.application.services.stock_sales_service
+    apps.orders.tests.* -> apps.inventory.contracts.stock_sales
+    apps.orders.tests.* -> apps.inventory.models
+    apps.orders.tests.* -> apps.inventory.subscribers
+    apps.users.tests.* -> apps.channels_core.models
+
+    # A2. Management command quét dữ liệu của MỌI app (13 entry, đếm lại 2026-09-25).
+    #     `seed_initial_data` dựng dữ liệu mẫu, `staging_neutralize` xoá dữ liệu
+    #     nhạy cảm — theo định nghĩa phải chạm mọi app. Không có cách nào tách mà
+    #     vẫn giữ đúng mục đích.
+    # 2026-08-20 (tách catalog): seed vẫn dựng Product mẫu — import đổi đích
+    # orders.models → catalog.models, không phải ngoại lệ mới.
+    apps.users.management.commands.impl.seed_initial_data_impl -> apps.catalog.models
+    apps.users.management.commands.impl.seed_initial_data_impl -> apps.customers.models
+    apps.users.management.commands.impl.seed_initial_data_impl -> apps.kiotviet.models
+    apps.users.management.commands.impl.seed_initial_data_impl -> apps.orders.models
+    apps.users.management.commands.staging_neutralize -> apps.best_express.models
+    apps.users.management.commands.staging_neutralize -> apps.facebook_ads.models
+    apps.users.management.commands.staging_neutralize -> apps.google_ads.models
+    apps.users.management.commands.staging_neutralize -> apps.kiotviet.models
+    # Bổ sung 2026-08-19 (lộ ra khi contract phủ đủ 21 app):
+    apps.users.management.commands.impl.seed_initial_data_impl -> apps.audit.models
+    apps.users.management.commands.impl.seed_initial_data_impl -> apps.channels_core.models
+    # Bổ sung 2026-09-19 (system-settings-db): staging_neutralize xoá thêm các dòng
+    # system_settings staging_forbidden/inbound_tokens — cùng bản chất A2, command
+    # quét MỌI app theo định nghĩa.
+    apps.users.management.commands.staging_neutralize -> apps.sysconfig.models
+    apps.users.management.commands.staging_neutralize -> apps.sysconfig.registry
+    apps.users.management.commands.staging_neutralize -> apps.sysconfig.service
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # KHỐI B — NỢ PHẢI TRẢ (100 entry = 2 B-Lô2 + 2 B-CÒN LẠI + 96 B-Lô6). CHỈ ĐƯỢC GIẢM.
+    # Cập nhật lần cuối: 2026-09-23 (audit C3: 106 → 100 — 6 entry orders→customers
+    # chỉ vì phone_utils biến mất khi module đó về apps/common; 4 entry đổi đích
+    # orders.services → order_service_impl, 2 entry đổi module khi tách repositories/
+    # và chuyển bucket_of xuống contact_flow.application). Số header đo bằng script
+    # trong test apps/common/tests/test_importlinter_counts.py — sai là test đỏ.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # B-Lô1 — ĐÃ TRẢ XONG (4 entry). `orders.invoice` gọi KiotViet qua
+    # `orders/contracts/kiotviet_invoice_port.py` + `kiotviet/adapters.py`.
+
+    # B-Lô2 — trả 4/5 entry. Luồng tạo/sửa đơn đi qua
+    # `orders/contracts/kiotviet_order_flow_port.py`.
+    # Nợ còn lại: `KiotVietChannel` dùng ở `queryset=` của DRF field — cần lúc
+    # import module. Gỡ được nó phải đổi cách serializer dựng field (defer
+    # queryset). Sau khi gỡ chuỗi star-import (2026-08-20), tên này được import
+    # THẲNG ở 2 module dùng nó thay vì chảy qua `product_item_crm_serializers`,
+    # nên 1 entry cũ tách thành 2 entry dưới đây (cùng một khoản nợ).
+    apps.orders.transport.serializers.order_serializers_impl.kiotviet_landing_serializers -> apps.kiotviet.models
+    apps.orders.transport.serializers.order_serializers_impl.order_action_serializers -> apps.kiotviet.models
+
+    # B-Lô3 — ĐÃ TRẢ XONG (2 entry). Xác minh huỷ hoá đơn đi qua
+    # `orders/contracts/kiotviet_cancellation_port.py`. Port này dịch cả enum
+    # (`CancelCheck` → `CancelVerdict`) lẫn exception ở biên adapter, vì orders
+    # so sánh verdict bằng `is` chứ không phải `==`.
+
+    # B-Lô4 — ĐÃ TRẢ XONG (2 entry). Consumer realtime đi qua
+    # `channels_core/contracts.py`. CHIỀU NGƯỢC với Lô 1-3: channels_core nằm DƯỚI
+    # orders nên app tầng dưới khai port, orders đăng ký adapter ở
+    # `OrdersConfig.ready()` (`apps/orders/adapters.py`).
+
+    # B-Lô5 — ĐÃ TRẢ XONG (3 entry).
+    #   • Báo cáo đọc chi tiêu quảng cáo qua `orders/contracts/ads_spend_port.py`;
+    #     mỗi app quảng cáo tự đăng ký provider (`facebook_ads|google_ads/adapters.py`).
+    #   • `inventory` đẩy trạng thái giao hàng qua
+    #     `inventory/contracts/kiotviet_delivery_port.py`.
+
+    # B-CÒN LẠI (2 entry). Không refactor thẳng được, cần quyết định riêng —
+    # xem §"Sau Lô 5" của docs/import-layering-debt-paydown-2026-08.md.
+    apps.users.serializers -> apps.kiotviet.models
+    apps.users.subscribers -> apps.hr.contracts.hr_events
+
+    # B-Lô6 — PHÁT HIỆN AUDIT 2026-08-19 (117 entry, còn 96 sau 2026-09-23). Toàn bộ số nợ này
+    # TỒN TẠI TỪ TRƯỚC nhưng vô hình vì delimiter `:` không kiểm tra độc lập cùng
+    # tầng và 7 app nằm ngoài contract. Đây không phải nợ mới phát sinh — là nợ cũ
+    # được đưa ra ánh sáng. Nhóm lớn: customers↔orders (44), inventory→orders (24),
+    # channels_core↔users (18). Trả dần theo lô, quy tắc như cũ: khối này CHỈ
+    # ĐƯỢC GIẢM.
+    # ĐÃ TRẢ 2026-08-19: nhóm *→kiotviet.EncryptedCharField (11 entry, audit ghi
+    # 12 do đếm lẫn 1 entry lý do khác) — field move sang apps/common/fields.py,
+    # migration cũ đổi path state-safe, xem audit-2026-08-19 mục C1.
+    # ĐÃ TRẢ 2026-08-20 (tách catalog, 106→104): combo_expansion + excel_lines chỉ
+    # đụng Product/ProductComponent — model move sang apps.catalog nên hai module
+    # này hết import orders.models (inventory→catalog là hợp tầng, không cần entry).
+    # audit -> dispatch (2)
+    apps.audit.decorators -> apps.dispatch
+    apps.audit.middleware_impl -> apps.dispatch
+    # audit -> exports (1)
+    apps.audit.exports_definitions -> apps.exports.application.registry
+    # channels_core -> users (14)
+    apps.channels_core.consumers -> apps.users.field_policy
+    apps.channels_core.consumers -> apps.users.rbac
+    apps.channels_core.consumers -> apps.users.scoping
+    apps.channels_core.infrastructure.repositories.channel_repositories_impl -> apps.users.constants
+    apps.channels_core.infrastructure.repositories.channel_repositories_impl -> apps.users.department_membership
+    apps.channels_core.infrastructure.repositories.channel_repositories_impl -> apps.users.models
+    apps.channels_core.infrastructure.repositories.channel_repositories_impl -> apps.users.rbac
+    apps.channels_core.services -> apps.users.rbac
+    apps.channels_core.transport.serializers.channel_serializers_impl -> apps.users.models
+    apps.channels_core.transport.views.channel_views_impl -> apps.users.constants
+    apps.channels_core.transport.views.channel_views_impl -> apps.users.department_membership
+    apps.channels_core.transport.views.channel_views_impl -> apps.users.models
+    apps.channels_core.transport.views.channel_views_impl -> apps.users.permissions
+    apps.channels_core.transport.views.channel_views_impl -> apps.users.rbac
+    # customers -> orders (17)
+    apps.customers.customer_loyalty_service -> apps.orders.models
+    apps.customers.customer_resale_service -> apps.orders.application.services.sale_reminder_service
+    apps.customers.customer_resale_service -> apps.orders.crm_catalog
+    apps.customers.customer_resale_service -> apps.orders.models
+    apps.customers.profile_service -> apps.orders.crm_catalog
+    apps.customers.profile_service -> apps.orders.models
+    apps.customers.segment_snapshot_service -> apps.orders.models
+    apps.customers.serializers -> apps.orders.crm_catalog
+    apps.customers.services -> apps.orders.crm_catalog
+    apps.customers.services -> apps.orders.repositories
+    apps.customers.transport.views.customers_views_impl.customer_profile_view -> apps.orders.application.services.sale_reminder_service
+    apps.customers.transport.views.customers_views_impl.customer_profile_view -> apps.orders.repositories
+    apps.customers.transport.views.customers_views_impl.customer_profile_view -> apps.orders.serializers
+    apps.customers.transport.views.customers_views_impl.customer_profile_view -> apps.orders.transport.views.order_views_impl._view_helpers
+    apps.customers.transport.views.customers_views_impl.resale_tracking_view -> apps.orders.application.services.order_service_impl
+    apps.customers.transport.views.customers_views_impl.resale_tracking_view -> apps.orders.transport.views.order_views_impl._view_helpers
+    apps.customers.views -> apps.orders.application.services.order_service_impl
+    # dispatch -> audit (1)
+    apps.dispatch.api -> apps.audit.models
+    # facebook_ads -> kiotviet (1)
+    apps.facebook_ads.infrastructure.lark_ads_report_sync -> apps.kiotviet.infrastructure.services.lark_bitable_client
+    # foxia -> facebook_ads (1)
+    apps.foxia.application.services.report_service -> apps.facebook_ads.models
+    # foxia -> google_ads (1)
+    apps.foxia.application.services.report_service -> apps.google_ads.models
+    # inventory -> orders (25)
+    apps.inventory.application.services.awaiting_return_service -> apps.orders.models
+    # NỢ MỚI có chủ đích (2026-08-25, Task 5 — đơn bán trực tiếp "xuất sau").
+    # ManualDispatchService cần đọc apps.orders.{crm_catalog,models,services} y hệt
+    # các service kho anh em trong nhóm B-Lô6 này (awaiting_return_service,
+    # pending_scan_service, dispatch_history_service...) — cùng loại nợ, không phải
+    # lọt vào vô tình. Trả CÙNG ĐỢT với cả nhóm khi tách port/adapter cho toàn bộ
+    # inventory→orders, không tách riêng cho một service.
+    apps.inventory.application.services.manual_dispatch_service -> apps.orders.crm_catalog
+    apps.inventory.application.services.manual_dispatch_service -> apps.orders.models
+    apps.inventory.application.services.manual_dispatch_service -> apps.orders.application.services.order_service_impl
+    apps.inventory.application.services.dispatch_history_service -> apps.orders.models
+    apps.inventory.application.services.flow_summary_service -> apps.orders.models
+    apps.inventory.application.services.pending_scan_service -> apps.orders.crm_catalog
+    apps.inventory.application.services.pending_scan_service -> apps.orders.models
+    apps.inventory.application.services.pending_scan_service -> apps.orders.application.services.order_service_impl
+    apps.inventory.application.services.reissue_ledger_repair_service -> apps.orders.models
+    apps.inventory.application.services.reissue_sibling -> apps.orders.models
+    apps.inventory.application.services.return_entry_adjust_service -> apps.orders.models
+    apps.inventory.application.services.return_entry_service -> apps.orders.models
+    apps.inventory.application.services.return_order_sync -> apps.orders.contracts.order_events
+    apps.inventory.application.services.return_order_sync -> apps.orders.models
+    apps.inventory.application.services.revived_stock_audit_service -> apps.orders.models
+    apps.inventory.application.services.stock_query_service -> apps.orders.models
+    apps.inventory.exports_definitions -> apps.orders.models
+    apps.inventory.subscribers -> apps.orders.contracts.order_events
+    apps.inventory.subscribers -> apps.orders.infrastructure.lark_notifier
+    apps.inventory.subscribers -> apps.orders.models
+    apps.inventory.tasks -> apps.orders.infrastructure.lark_notifier
+    apps.inventory.transport.views.flow_pending_views -> apps.orders.crm_catalog
+    apps.inventory.transport.views.flow_pending_views -> apps.orders.models
+    apps.inventory.transport.views.flow_pending_views -> apps.orders.repositories
+    # inventory -> warranty (1)
+    apps.inventory.application.services.pending_scan_service -> apps.warranty.journey_service
+    # orders -> callcenter (1)
+    apps.orders.repositories.list_filter_flags -> apps.callcenter.models
+    # orders -> contact_flow (5)
+    apps.orders.application.services.contact_list_operation -> apps.contact_flow.models
+    apps.orders.application.services.contact_list_operation -> apps.contact_flow.application.services.buckets
+    apps.orders.application.services.order_service_commands -> apps.contact_flow.application.services.entry_service
+    apps.orders.transport.serializers.contact_serializers -> apps.contact_flow.transport.serializers.runtime_serializers
+    apps.orders.transport.views.order_views_impl.order_ingest_views -> apps.contact_flow.application.services.entry_service
+    # orders -> customers (21). 2026-08-20: +4 entry nhưng KHÔNG phải nợ mới —
+    # gỡ chuỗi star-import làm các tên (Customer/CustomerService/normalize_*)
+    # được import THẲNG ở module dùng chúng thay vì chảy qua
+    # product_item_crm_serializers / order_service_shared; cùng một khoản nợ
+    # hiện rõ theo từng module.
+    apps.orders.transport.serializers.order_serializers_impl.product_item_crm_serializers -> apps.customers.services
+    apps.orders.transport.serializers.order_serializers_impl.kiotviet_landing_serializers -> apps.customers.services
+    apps.orders.transport.serializers.order_serializers_impl.order_action_serializers -> apps.customers.services
+    apps.orders.application.services.order_service_commands -> apps.customers.models
+    apps.orders.application.services.order_service_commands -> apps.customers.services
+    apps.orders.application.services.contact_activity_service -> apps.customers.models
+    apps.orders.application.services.contact_list_service -> apps.customers.models
+    apps.orders.application.services.lead_filter_service -> apps.customers.services
+    apps.orders.application.services.order_service_shared -> apps.customers.models
+    apps.orders.application.services.order_service_shared -> apps.customers.services
+    apps.orders.kiotviet_validation -> apps.customers.services
+    apps.orders.management.commands.import_assessment_csv -> apps.customers.models
+    apps.orders.management.commands.import_assessment_csv -> apps.customers.services
+    apps.orders.models -> apps.customers.models
+    apps.orders.transport.views.order_views_impl.contact_scope -> apps.customers.models
+    apps.orders.transport.views.order_views_impl.order_action_view -> apps.customers.customer_type
+    # orders -> inventory (6)
+    apps.orders.application.services.order_service_commands -> apps.inventory.application.services.stock_sales_service
+    apps.orders.infrastructure.tasks.order_tasks_impl.lark_notification_tasks -> apps.inventory.application.services.reissue_sibling
+    apps.orders.application.services.order_service_commands -> apps.inventory.contracts.stock_sales
+    apps.orders.transport.views.shipping_lookup_view -> apps.inventory.application.services.pending_scan_service
+    apps.orders.transport.views.shipping_lookup_view -> apps.inventory.application.services.stock_sales_service
+    apps.orders.transport.views.shipping_lookup_view -> apps.inventory.models
+    # users -> channels_core (4)
+    apps.users.rbac -> apps.channels_core.models
+    apps.users.scoping -> apps.channels_core.models
+    apps.users.services -> apps.channels_core.cache_utils
+    apps.users.services -> apps.channels_core.models
+
+
+# Audit 2026-09-23 (T3/P2-2): tầng domain phải PURE — không django / DRF / celery.
+# Giá trị settings/timezone đi qua tham số từ application/transport (xem
+# hr/domain/workday.py, warranty_codes/domain/serial.py, daily_report/domain/periods.py,
+# best_express/domain/status_map.py). Wildcard `apps.*.domain` bắt luôn app mới.
+# Chỉ bắt import TRỰC TIẾP (allow_indirect_imports): domain còn 3 chỗ import
+# `<app>.models` (foxia.domain.catalog_specs, hr.domain.leave,
+# orders.domain.contact_rules) — đó là nợ domain → ORM, xử lý riêng, không che
+# bằng cách nới contract này.
+[importlinter:contract:domain-pure]
+name = Domain không import framework
+type = forbidden
+source_modules =
+    apps.*.domain
+forbidden_modules =
+    django
+    rest_framework
+    celery
+allow_indirect_imports = True

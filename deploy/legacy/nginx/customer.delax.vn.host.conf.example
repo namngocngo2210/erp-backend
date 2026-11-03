@@ -1,0 +1,224 @@
+# Host nginx vhost cho customer.delax.vn + erp.desiglobal.vn
+# (KHÔNG dùng nginx container).
+#
+# Phân vai domain:
+#   - customer.delax.vn  → CHỈ backend (API + WS), không serve frontend
+#   - erp.desiglobal.vn  → backend + frontend + grafana
+#
+# Copy file này → /etc/nginx/sites-available/customer.delax.vn
+# Symlink     → /etc/nginx/sites-enabled/customer.delax.vn
+# Reload      → sudo nginx -t && sudo systemctl reload nginx
+#
+# Yêu cầu:
+#   - Cert Let's Encrypt tại /etc/letsencrypt/live/customer.delax.vn/
+#     phải có SAN cover cả erp.desiglobal.vn (kiểm tra: sudo certbot certificates;
+#     thiếu thì: sudo certbot --nginx --expand -d customer.delax.vn -d erp.desiglobal.vn)
+#   - Compose chạy với web bind 127.0.0.1:8000 + frontend bind 127.0.0.1:8001
+#   - Zone rate limit đã cài (các `limit_req` bên dưới phụ thuộc):
+#       sudo cp nginx/rate-limit-zones.conf.example \
+#               /etc/nginx/conf.d/00-rate-limit-zones.conf
+#     Thiếu file đó → `nginx -t` báo "unknown limit_req zone" và không reload được.
+#
+# Security header (audit 2026-09-23 M4): đặt ở server-level, KHÔNG thêm
+# `add_header` khác trong location (nginx bỏ kế thừa khi location có add_header
+# riêng — khối `if OPTIONS` của ingest là ngoại lệ chủ ý: preflight 204 không cần).
+# Áp vào host thật: xem docs/runbooks/2026-09-23-audit-ops.md.
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# ── HTTP → HTTPS cho cả 2 domain ──
+server {
+    listen 80;
+    server_name customer.delax.vn erp.desiglobal.vn;
+    return 301 https://$host$request_uri;
+}
+
+# ═══ customer.delax.vn — CHỈ backend (API + WS) ═══
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name customer.delax.vn;
+
+    ssl_certificate     /etc/letsencrypt/live/customer.delax.vn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/customer.delax.vn/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    client_max_body_size 50m;
+
+    # ── Security header (audit 2026-09-23 M4; mẫu vhost tra-cuu) ──
+    # Django SecurityMiddleware cũng đặt HSTS/nosniff/XFO cho /api/ — ẩn bản của
+    # upstream để nginx là nguồn duy nhất, không trả header trùng hai lần.
+    server_tokens off;
+    proxy_hide_header Strict-Transport-Security;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header Referrer-Policy;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # ── Đăng nhập + refresh token: zone chặt hơn /api/ chung (chống brute-force) ──
+    location ~ ^/api/users/(login|token/refresh)/?$ {
+        limit_req zone=desi_api_auth burst=20 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ── Landing ingest với CORS preflight ──
+    location ~ ^/api/orders/ingest/?$ {
+        limit_req zone=desi_api_ingest burst=60 nodelay;
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin  "https://www.delax.click" always;
+            add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Content-Type, X-Api-Token" always;
+            add_header Access-Control-Max-Age 86400 always;
+            add_header Content-Length 0;
+            add_header Content-Type text/plain;
+            return 204;
+        }
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ── REST API → web container ──
+    location /api/ {
+        limit_req zone=desi_api_general burst=40 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    # ── WebSocket → web container (Channels) ──
+    location /ws/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    # ── Mọi path còn lại cũng vào backend, KHÔNG serve frontend ──
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# ═══ erp.desiglobal.vn — backend + frontend + grafana ═══
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name erp.desiglobal.vn;
+
+    ssl_certificate     /etc/letsencrypt/live/customer.delax.vn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/customer.delax.vn/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    client_max_body_size 50m;
+
+    # ── Security header (audit 2026-09-23 M4; mẫu vhost tra-cuu) ──
+    # Django SecurityMiddleware cũng đặt HSTS/nosniff/XFO cho /api/ — ẩn bản của
+    # upstream để nginx là nguồn duy nhất, không trả header trùng hai lần.
+    server_tokens off;
+    proxy_hide_header Strict-Transport-Security;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header Referrer-Policy;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(self), microphone=(self), geolocation=(self)" always;
+    # CSP Report-Only cho SPA ERP (xem frontend/nginx.conf để biết vì sao từng nguồn
+    # có mặt). Theo dõi rồi mới enforce. Grafana ở /grafana tự đặt CSP riêng.
+    add_header Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self' 'unsafe-inline' https://ajax.googleapis.com https://cdn.zenify.biz; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; media-src 'self' blob: https:; worker-src 'self' blob:; frame-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'" always;
+
+    # ── Đăng nhập + refresh token: zone chặt hơn /api/ chung (chống brute-force) ──
+    location ~ ^/api/users/(login|token/refresh)/?$ {
+        limit_req zone=desi_api_auth burst=20 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ── REST API → web container ──
+    location /api/ {
+        limit_req zone=desi_api_general burst=40 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    # ── WebSocket → web container (Channels) ──
+    location /ws/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    # ── Frontend assets + SPA → frontend container ──
+    # Frontend container đã có cache headers cho /assets/, gzip, SPA fallback.
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ── Grafana (subpath /grafana, xem nginx/grafana-subpath.location.example) ──
+    location /grafana {
+        proxy_pass http://127.0.0.1:3001;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 300s;
+    }
+}

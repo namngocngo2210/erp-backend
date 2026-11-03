@@ -1,0 +1,167 @@
+# Production vhost cho customer.delax.vn (Cloudflare Origin → nginx → web/frontend).
+#
+# Mount:
+#   - /etc/ssl/certs/delax.vn.pem   (Cloudflare Origin cert)
+#   - /etc/ssl/private/delax.vn.key
+#
+# Compose nginx service set ports 80 + 443 ra host. Cloudflare proxy mode
+# Full (strict) — TLS giữa Cloudflare và nginx này.
+#
+# PHỤ THUỘC: các directive `limit_req` bên dưới cần zone khai báo ở block `http`.
+# Cài trước:
+#   sudo cp nginx/rate-limit-zones.conf.example /etc/nginx/conf.d/00-rate-limit-zones.conf
+# Thiếu file đó thì `nginx -t` báo "unknown limit_req zone" và nginx KHÔNG reload
+# được — luôn `nginx -t` trước khi reload.
+
+server {
+  listen 80;
+  server_name customer.delax.vn;
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl;
+  http2 on;
+  server_name customer.delax.vn;
+
+  ssl_certificate     /etc/ssl/certs/delax.vn.pem;
+  ssl_certificate_key /etc/ssl/private/delax.vn.key;
+  ssl_protocols       TLSv1.2 TLSv1.3;
+  ssl_ciphers         HIGH:!aNULL:!MD5;
+  ssl_session_cache   shared:SSL:10m;
+  ssl_session_timeout 1d;
+
+  # ── Security headers (áp cho SPA + /api/; các location có add_header riêng sẽ
+  #    reset nên được lặp lại ở nơi cần) ──
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header X-Frame-Options "SAMEORIGIN" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  server_tokens off;
+
+  # Khớp DATA_UPLOAD_MAX_MEMORY_SIZE 10MB của Django + headroom (ảnh chấm công
+  # base64) — nginx default 1m sẽ chặn 413 trước khi request tới app.
+  client_max_body_size 12m;
+
+  # ── Prometheus metrics: chỉ cho mạng nội bộ, chặn truy cập từ internet ──
+  location = /api/orders/metrics {
+    allow 127.0.0.1;
+    allow 172.16.0.0/12;
+    allow 10.0.0.0/8;
+    allow 192.168.0.0/16;
+    deny all;
+    set $backend_upstream http://web:8000;
+    proxy_pass $backend_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # Healthz endpoint cho compose healthcheck
+  location = /healthz {
+    return 200 'ok';
+    add_header Content-Type text/plain;
+  }
+
+  # ── Frontend assets: tên file mang content-hash nên cache 1 năm, immutable
+  # (audit cache/latency 2026-08-11 §2.5). Đổi nội dung là đổi tên file. ──
+  location /assets/ {
+    set $frontend_upstream http://frontend:80;
+    proxy_pass $frontend_upstream;
+    expires 1y;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    proxy_set_header Host $host;
+  }
+
+  # ── Đăng nhập + refresh token: zone chặt hơn /api/ chung (chống brute-force) ──
+  # burst=20 để 9h sáng cả công ty đăng nhập cùng lúc không bị chặn oan — toàn bộ
+  # nhân sự văn phòng ra internet chung MỘT IP NAT nên zone này key theo IP phải
+  # đủ chỗ cho cả công ty.
+  location ~ ^/api/users/(login|token/refresh)/?$ {
+    limit_req zone=desi_api_auth burst=20 nodelay;
+    set $backend_upstream http://web:8000;
+    proxy_pass $backend_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # ── Landing ingest with CORS preflight ──
+  location ~ ^/api/orders/ingest/?$ {
+    # Zone riêng, rộng: landing đẩy đơn theo cụm, chặn nhầm = mất đơn thật.
+    limit_req zone=desi_api_ingest burst=60 nodelay;
+    if ($request_method = OPTIONS) {
+      add_header Access-Control-Allow-Origin  "*" always;
+      add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+      add_header Access-Control-Allow-Headers "Content-Type, X-Api-Token" always;
+      add_header Access-Control-Max-Age 86400 always;
+      add_header Content-Length 0;
+      add_header Content-Type text/plain;
+      return 204;
+    }
+    set $backend_upstream http://web:8000;
+    proxy_pass $backend_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # ── REST API → web container ──
+  location /api/ {
+    # Chặn flood TRƯỚC khi request chạm gunicorn. `location = /api/orders/metrics`
+    # ở trên là location riêng nên KHÔNG kế thừa giới hạn này (scraper nội bộ).
+    limit_req zone=desi_api_general burst=40 nodelay;
+    set $backend_upstream http://web:8000;
+    proxy_pass $backend_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # Mặc định của nginx là 60s. Hai endpoint HR (bảng lương / chấm công tháng) vẫn
+    # chạy đồng bộ theo chủ đích (xem docs/superpowers/specs/2026-08-06-async-export-jobs-design.md
+    # mục 2), và các báo cáo nặng khác cũng vượt 60s khi kỳ lọc rộng — 60s là quả mìn
+    # hẹn giờ, không phải hàng rào bảo vệ.
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+  }
+
+  # ── WebSocket → web container (Channels) ──
+  location /ws/ {
+    set $backend_upstream http://web:8000;
+    proxy_pass $backend_upstream;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_buffering off;
+  }
+
+  # ── Frontend SPA fallback ──
+  location / {
+    set $frontend_upstream http://frontend:80;
+    proxy_pass $frontend_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # Stub status (private, cho nginx-exporter)
+  location = /nginx_status {
+    stub_status;
+    access_log off;
+    allow 172.16.0.0/12;
+    allow 10.0.0.0/8;
+    allow 192.168.0.0/16;
+    allow 127.0.0.1;
+    deny all;
+  }
+}

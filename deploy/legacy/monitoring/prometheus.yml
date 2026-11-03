@@ -1,0 +1,67 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    service: desi-order
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Django backend (landing ingest + future app-level metrics).
+  # Dùng service name `web` (không phải container name `desi-web`) để khớp với
+  # DJANGO_ALLOWED_HOSTS — Django trả 400 nếu Host header không nằm trong list.
+  - job_name: desi-backend
+    metrics_path: /api/orders/metrics
+    static_configs:
+      - targets: ["web:8000"]
+        labels:
+          component: backend
+          process: web
+
+  # Host (Docker Desktop VM trên macOS, Linux host trên prod)
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          component: host
+
+  # Container metrics (RAM/CPU/network/disk per container)
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels:
+          component: containers
+    metric_relabel_configs:
+      - source_labels: [container_label_com_docker_compose_service]
+        target_label: service
+      - source_labels: [container_label_com_docker_compose_project]
+        target_label: project
+
+  - job_name: redis-exporter
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+        labels:
+          component: redis
+
+  - job_name: postgres-exporter
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels:
+          component: postgres
+
+  # Celery (queue length, task events). Cần service celery-exporter bên dưới.
+  - job_name: celery-exporter
+    static_configs:
+      - targets: ["celery-exporter:9808"]
+        labels:
+          component: celery

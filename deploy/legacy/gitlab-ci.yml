@@ -1,0 +1,318 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI cho GitLab (audit 2026-07-23, mục N1).
+#
+# VÌ SAO FILE NÀY TỒN TẠI: repo được host trên gitlab.com nhưng CI trước đó chỉ
+# được định nghĩa ở `.github/workflows/*.yml` — cú pháp GitHub Actions. GitLab
+# KHÔNG đọc thư mục đó (nó chỉ đọc `.gitlab-ci.yml`), nên trên thực tế
+# **không có kiểm tra tự động nào chạy** khi push/mở MR.
+#
+# Đồng thời sửa luôn lỗi gốc của N1: chạy `pytest`, KHÔNG phải `manage.py test`.
+# Test runner unittest của Django chỉ thu thập subclass TestCase → 817/2135 test
+# (38%) viết theo phong cách pytest function không bao giờ được chạy.
+#   Đo 2026-07-23: django runner 1318 test · pytest 2135 test.
+#
+# ⚠️ VẬN HÀNH: file này chỉ có tác dụng khi project đã gắn GitLab Runner (shared
+# runner của gitlab.com hoặc self-hosted). Nếu chưa có runner, pipeline sẽ nằm ở
+# trạng thái "pending" mãi. Kiểm tra: Settings → CI/CD → Runners.
+# ─────────────────────────────────────────────────────────────────────────────
+
+stages:
+  - lint
+  - test
+  - build
+
+default:
+  interruptible: true
+
+# ══════════════════════════════ BACKEND ══════════════════════════════════════
+
+.backend_base:
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  before_script:
+    - cd backend
+    # Cài vào system python rồi gọi `python` TRỰC TIẾP — KHÔNG dùng `uv run`.
+    # backend/pyproject.toml tồn tại (để cấu hình ruff) nhưng KHÔNG khai báo
+    # dependencies; `uv run` thấy pyproject sẽ dựng venv riêng theo project và
+    # không nhìn thấy package vừa cài → ModuleNotFoundError: No module named 'django'.
+    - uv pip install --system -r requirements.txt
+  cache:
+    key: "uv-$CI_COMMIT_REF_SLUG"
+    paths: [.cache/uv]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [backend/**/*, .gitlab-ci.yml]
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+      changes: [backend/**/*, .gitlab-ci.yml]
+
+backend:lint:
+  # KHÔNG extends .backend_base: ruff không nằm trong requirements.txt và không
+  # cần app dependencies — cài cả bộ chỉ để lint là phí vài phút mỗi pipeline.
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  stage: lint
+  before_script:
+    - cd backend
+  script:
+    # Ruleset + danh sách nợ ở backend/pyproject.toml [tool.ruff.lint].
+    # Đã sạch lúc cấu hình → job này chặn NỢ MỚI ngay từ vi phạm đầu tiên.
+    # Ghim phiên bản KHỚP requirements-dev.txt (audit 2026-09-23 N1): `uvx ruff`
+    # không ghim = mỗi pipeline một ruff khác nhau, rule mới làm đỏ MR không liên quan.
+    - uvx ruff@0.16.1 check .
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [backend/**/*, .gitlab-ci.yml]
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+      changes: [backend/**/*, .gitlab-ci.yml]
+
+monitoring:alert-rules:
+  # Alert rule cũng là code và cũng hỏng âm thầm được. Sự cố 2026-07-29 phơi ra hai
+  # rule connection Postgres so sánh hai vector có label lệch nhau — cú pháp hợp lệ,
+  # `promtool check rules` xanh, nhưng phép so sánh luôn trả rỗng nên alert KHÔNG BAO
+  # GIỜ bắn. Từ 23/07 tới 29/07 không ai biết, vì cách duy nhất phát hiện là chạy rule
+  # với dữ liệu thật. Job này làm đúng việc đó (monitoring/alerts_test.yml).
+  image:
+    name: prom/prometheus:v3.13.0
+    # Image này có entrypoint là chính prometheus — không xoá thì runner cố khởi
+    # động server thay vì chạy script.
+    entrypoint: [""]
+  stage: lint
+  before_script:
+    - cd monitoring
+  script:
+    - promtool check rules alerts.yml
+    - promtool test rules alerts_test.yml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [monitoring/**/*, .gitlab-ci.yml]
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+      changes: [monitoring/**/*, .gitlab-ci.yml]
+
+backend:lint-imports:
+  # Static analysis (grimp) — không cần DB hay app dependencies.
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  stage: lint
+  before_script:
+    - cd backend
+    - uv pip install --system -r requirements-dev.txt
+  script:
+    - lint-imports
+    # Ratchet kích thước code + nợ ruff (audit 2026-09-23 C3): fail khi file >800 /
+    # hàm >150 / class >1000 đã có trong scripts/arch-baseline.json TĂNG dòng, file mới
+    # vượt trần, hoặc số vi phạm của một rule ruff đang ignore tăng. Trả nợ xong thì
+    # `python scripts/arch_baseline.py --update` (chỉ được hạ). Cần ruff cùng phiên bản
+    # requirements-dev.txt — đã cài ở before_script.
+    - python ../scripts/arch_baseline.py --check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [backend/**/*, scripts/arch*, .gitlab-ci.yml]
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+      changes: [backend/**/*, scripts/arch*, .gitlab-ci.yml]
+
+backend:typecheck:
+  # mypy PHẠM VI HẸP — chỉ apps/*/contracts/ + apps/common (danh sách `files` ở
+  # backend/pyproject.toml [tool.mypy]). Static analysis thuần: follow_imports=skip
+  # nên không cần app dependencies, DB hay settings — chỉ requirements-dev.txt
+  # (mypy + django-stubs, không dùng plugin — lý do trong comment config).
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  stage: lint
+  before_script:
+    - cd backend
+    - uv pip install --system -r requirements-dev.txt
+  script:
+    - mypy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [backend/**/*, .gitlab-ci.yml]
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+      changes: [backend/**/*, .gitlab-ci.yml]
+
+ops:compose-render:
+  # Compose cũng là code, và nó hỏng theo kiểu CI cũ KHÔNG thấy: 2026-07-30 23:33
+  # prod chết toàn bộ vì anchor env passthrough ${POSTGRES_HOST} — giá trị localhost
+  # của host rò vào container. Pipeline hôm đó xanh 8/8 vì không job nào render
+  # compose. Job này render và khẳng định giá trị thật (chi tiết trong script).
+  # `docker compose config` chỉ nội suy + parse, KHÔNG cần daemon → không cần dind.
+  image: docker:27-cli
+  stage: lint
+  script:
+    - sh scripts/check-compose-render.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [docker-compose*.yml, scripts/check-compose-render.sh, .gitlab-ci.yml]
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+      changes: [docker-compose*.yml, scripts/check-compose-render.sh, .gitlab-ci.yml]
+
+backend:test:
+  extends: .backend_base
+  stage: test
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+    - name: redis:7-alpine
+      alias: redis
+  variables:
+    POSTGRES_DB: desi_test
+    POSTGRES_USER: desi
+    POSTGRES_PASSWORD: ci-postgres-pass
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    REDIS_PASSWORD: ""
+    APP_ENV: development
+    DJANGO_DEBUG: "0"
+    DJANGO_SECRET_KEY: ci-secret-key-not-for-production
+    JWT_SIGNING_KEY: ci-jwt-signing-key-at-least-32-bytes-long
+    # Migration kiotviet 0009 đòi Fernet key hợp lệ — thiếu là cả suite fail lúc setup.
+    ENCRYPTION_KEY: "n2Yl6TfjP9F1nQbYyZzQ0vJ0eKk8mR3sT7uW1xA5cB4="
+  script:
+    # pytest-cov chỉ có ở requirements-dev.txt (không vào image prod) — cài đúng
+    # dòng đã ghim ở đó để CI và máy dev cùng phiên bản.
+    - uv pip install --system "$(grep '^pytest-cov==' requirements-dev.txt)"
+    # Chặn build nếu model đổi mà chưa tạo migration.
+    - python manage.py makemigrations --check --dry-run
+    # pytest — KHÔNG dùng `manage.py test` (xem ghi chú đầu file).
+    # Coverage (audit 2026-09-23 C9): Cobertura cho MR diff + số % trên badge.
+    - pytest apps -q --junitxml=report.xml --cov=apps --cov-report=xml:coverage.xml --cov-report=term --cov-fail-under=84
+  coverage: '/^TOTAL.+?(\d+\%)$/'
+  artifacts:
+    when: always
+    reports:
+      junit: backend/report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: backend/coverage.xml
+    expire_in: 1 week
+
+backend:openapi-contract:
+  extends: .backend_base
+  stage: test
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: desi_test
+    POSTGRES_USER: desi
+    POSTGRES_PASSWORD: ci-postgres-pass
+    POSTGRES_HOST: postgres
+    APP_ENV: development
+    DJANGO_SECRET_KEY: ci-secret-key-not-for-production
+    JWT_SIGNING_KEY: ci-jwt-signing-key-at-least-32-bytes-long
+    ENCRYPTION_KEY: "n2Yl6TfjP9F1nQbYyZzQ0vJ0eKk8mR3sT7uW1xA5cB4="
+  script:
+    # schema.yaml là hợp đồng FE↔BE.
+    # (1) Completeness: 0 "Error [" — endpoint mới quên @extend_schema → đỏ.
+    # (2) Drift: schema.yaml phải khớp code.
+    - python manage.py spectacular --file /tmp/schema.ci.yaml 2>/tmp/spectacular.log
+    - |
+      if grep -q 'Error \[' /tmp/spectacular.log; then
+        echo "Có endpoint thiếu @extend_schema. Thêm @extend_schema(request=..., responses=...) hoặc @extend_schema(exclude=True)."
+        grep 'Error \[' /tmp/spectacular.log | head -20
+        exit 1
+      fi
+    - |
+      if ! diff -u schema.yaml /tmp/schema.ci.yaml; then
+        echo "schema.yaml lệch với code. Chạy: python manage.py spectacular --file schema.yaml rồi commit lại."
+        exit 1
+      fi
+
+backend:pip-audit:
+  # Quét lỗ hổng phụ thuộc — chỉ đọc requirements.txt, không cần cài app.
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  stage: lint
+  before_script:
+    - cd backend
+  script:
+    - uvx pip-audit -r requirements.txt
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [backend/**/*, .gitlab-ci.yml]
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+      changes: [backend/**/*, .gitlab-ci.yml]
+
+# ══════════════════════════════ FRONTEND ═════════════════════════════════════
+
+.frontend_base:
+  image: node:22
+  before_script:
+    - cd frontend
+    - npm ci
+  cache:
+    key: "npm-$CI_COMMIT_REF_SLUG"
+    paths: [frontend/node_modules]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [frontend/**/*, backend/schema.yaml, .gitlab-ci.yml]
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+      changes: [frontend/**/*, backend/schema.yaml, .gitlab-ci.yml]
+
+frontend:lint:
+  extends: .frontend_base
+  stage: lint
+  script:
+    - npm run format:check
+    - npm run lint:strict
+    # knip: file/export/dependency không ai dùng — đỏ là có code chết mới (audit 2026-09-23 P1-3).
+    - npm run lint:dead
+
+frontend:test:
+  extends: .frontend_base
+  stage: test
+  script:
+    - npm run typecheck
+    - npm run test:ci
+
+frontend:openapi-types:
+  extends: .frontend_base
+  stage: test
+  script:
+    # Đổi schema BE mà quên `npm run gen:api` → đỏ.
+    - npm run gen:api
+    - |
+      if ! git diff --exit-code src/api/schema.d.ts; then
+        echo "src/api/schema.d.ts lệch với backend/schema.yaml. Chạy: npm run gen:api rồi commit lại."
+        exit 1
+      fi
+
+frontend:build:
+  extends: .frontend_base
+  stage: build
+  variables:
+    # Định danh bản build, dùng chung cho lúc upload sourcemap và lúc Sentry.init
+    # ở runtime — lệch giá trị này thì Sentry không giải mã được stack trace.
+    # SENTRY_AUTH_TOKEN/SENTRY_ORG/SENTRY_PROJECT khai ở Settings → CI/CD → Variables
+    # (không hardcode token ở đây); thiếu token thì build vẫn chạy, chỉ bỏ qua upload.
+    VITE_SENTRY_RELEASE: $CI_COMMIT_SHA
+  script:
+    - npm run build
+  artifacts:
+    paths: [frontend/dist]
+    # sourcemap chỉ để upload lên Sentry, không phát tán kèm artifact (14MB map và
+    # đọc ra được toàn bộ source). Không job nào consume artifact này nên loại an toàn.
+    exclude: ["frontend/dist/**/*.map"]
+    expire_in: 1 week
+
+# ══════════════════════════ DOCKER IMAGE (thủ công) ══════════════════════════
+# Build image chỉ để bắt lỗi Dockerfile — KHÔNG push (push cần credentials).
+# Đặt `when: manual` để không đốt CI minutes mỗi lần push: đội đang self-deploy,
+# không có pipeline build tự động (xem docs/go-offload-plan.md §deploy).
+
+.docker_image:
+  stage: build
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  rules:
+    - when: manual
+      allow_failure: true
+
+docker:backend-image:
+  extends: .docker_image
+  script:
+    - docker build -t desi-backend:ci backend
+
+docker:frontend-image:
+  extends: .docker_image
+  script:
+    - docker build -t desi-frontend:ci frontend

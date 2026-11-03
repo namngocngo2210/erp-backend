@@ -1,0 +1,162 @@
+# Host nginx vhost cho delax.com.vn — portal khách hàng công khai + trang sản
+# phẩm quét QR (KHÔNG dùng nginx container — đây là bản dùng trên PROD hiện
+# tại, upstream trỏ 127.0.0.1 giống customer.delax.vn.host.conf.example và
+# tra-cuu.delax.asia.host.conf.example).
+#
+# ⚠️ TÁI DỰNG BEST-EFFORT: xem đầu file `delax.com.vn.conf.prod-template` —
+# domain này ĐANG chạy thật trên prod (xác nhận `GET https://delax.com.vn/bao-hanh`
+# trả 200) nhưng config sống không nằm trong version control. File này là bản
+# host-nginx thực sự deploy được — bản `.conf.prod-template` cạnh đây dùng DNS
+# container (`web:8000`/`frontend:80`), chỉ đúng nếu nginx chạy TRONG compose;
+# `docker-compose.prod.yml` xác nhận prod KHÔNG chạy vậy ("SSL termination +
+# reverse proxy: HOST nginx (systemd) — KHÔNG có nginx trong compose").
+#
+# Cài đặt:
+#   sudo cp nginx/delax.com.vn.host.conf.example \
+#           /etc/nginx/sites-available/delax.com.vn
+#   sudo ln -s /etc/nginx/sites-available/delax.com.vn \
+#              /etc/nginx/sites-enabled/delax.com.vn
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Yêu cầu TRƯỚC khi enable:
+#   1) DNS `delax.com.vn` đã trỏ về IP máy chủ này (domain đang chạy thật nên
+#      khả năng cao đã trỏ sẵn — vẫn nên xác nhận bằng `dig delax.com.vn`).
+#   2) Chứng chỉ TLS cho domain:
+#      ⚠️ CHƯA XÁC ĐỊNH ĐƯỢC server thật dùng Let's Encrypt hay Cloudflare
+#      Origin cert cho domain này — đây là phần TÁI DỰNG, không đọc được từ
+#      config sống. File này dùng đường dẫn Let's Encrypt theo convention của
+#      `customer.delax.vn.host.conf.example` / `tra-cuu.delax.asia.host.conf.example`
+#      (2 file host khác trong repo đều dùng certbot). Nhưng
+#      `delax.com.vn.conf.prod-template` (bản container, cạnh file này) lại
+#      đoán theo Cloudflare Origin cert (`/etc/ssl/certs/delax.com.vn.pem`)
+#      theo convention của các `*.conf.prod-template` khác. CHỈ MỘT trong hai
+#      đúng với server thật — vận hành PHẢI kiểm tra
+#      `sudo certbot certificates` (và/hoặc dashboard Cloudflare cho domain
+#      này) trước khi bật file này, rồi sửa lại 2 dòng ssl_certificate* cho
+#      khớp thực tế.
+#   3) Compose chạy với web bind 127.0.0.1:8000 (frontend 127.0.0.1:8001) —
+#      đã đúng theo docker-compose.prod.yml hiện tại, không cần đổi.
+#   4) Zone rate limit đã cài (đã có `desi_portal_media` từ task này):
+#        sudo cp nginx/rate-limit-zones.conf.example \
+#                /etc/nginx/conf.d/00-rate-limit-zones.conf
+#      Thiếu file đó → `nginx -t` báo "unknown limit_req zone" và nginx KHÔNG
+#      reload được.
+#   5) `.env` prod: xác nhận `delax.com.vn` đã có trong DJANGO_ALLOWED_HOSTS
+#      và DJANGO_CSRF_TRUSTED_ORIGINS — nhiều khả năng đã có sẵn vì domain
+#      đang chạy thật, nhưng KHÔNG giả định, kiểm tra trước khi reload.
+#
+# CỐ Ý KHÔNG mở trên domain này: `/api/` chung, `/api/users/*`, `/ws/`,
+# `/nginx_status`, `/api/orders/*`. Domain khách chỉ cần portal + trang sản
+# phẩm + API portal.
+
+server {
+    listen 80;
+    server_name delax.com.vn;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    # Cú pháp `listen ... http2` (KHÔNG dùng directive `http2 on;`): nginx trên
+    # host prod hiện tại < 1.25.1 nên `http2 on;` báo `unknown directive` và
+    # `nginx -t` fail. Dạng này chạy được trên mọi phiên bản (từ 1.25.1 chỉ
+    # cảnh báo deprecated, không lỗi).
+    listen 443 ssl http2;
+    server_name delax.com.vn;
+
+    # ⚠️ Đường dẫn Let's Encrypt — CHƯA XÁC MINH khớp server thật, xem cảnh báo
+    # cert ở đầu file. certbot sẽ ghi đè 2 dòng này khi chạy
+    # `certbot --nginx -d delax.com.vn`.
+    ssl_certificate     /etc/letsencrypt/live/delax.com.vn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/delax.com.vn/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    server_tokens off;
+
+    client_max_body_size 2m;
+
+    # ── Nén response của upstream (audit cache/latency 2026-08-11 §2.4) ──
+    # `gzip_proxied off` (mặc định nginx) nghĩa là JSON của API KHÔNG được nginx
+    # nén, nên việc đó đang do zlib của Python làm trong `desi-web` — container
+    # chỉ có 1.5 CPU và CPU chính là nút cổ chai lúc bão.
+    # Bật ở đây chưa đổi gì chừng nào Django còn nén (nginx bỏ qua response đã có
+    # Content-Encoding). Bước 2: WEB_GZIP_IN_DJANGO=0 + restart web, verify theo
+    # docs/runbooks/2026-08-11-cache-latency-measurement.md §8.
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_min_length 1024;
+    gzip_comp_level 5;
+    gzip_types application/json application/javascript text/css text/plain image/svg+xml;
+
+    location = /healthz {
+        return 200 'ok';
+        add_header Content-Type text/plain;
+    }
+
+    # Khách vào gốc domain → portal. PHẢI là redirect thật (302), KHÔNG dùng
+    # `rewrite ^ /bao-hanh last;`: rewrite chỉ đổi URI nội bộ trong nginx, thanh
+    # địa chỉ trình duyệt vẫn là `/` → frontend/src/main.tsx rẽ nhánh theo
+    # `window.location.pathname` sẽ không thấy `/bao-hanh` và render app CRM
+    # (khách nhìn thấy màn đăng nhập nội bộ thay vì trang tra cứu).
+    location = / {
+        return 302 /bao-hanh;
+    }
+
+    # ── Ảnh sản phẩm trang /sp/ — zone RIÊNG rộng hơn desi_portal: một lượt
+    #    xem kéo tới 8 ảnh + 1 lần gọi payload = 9 request, zone desi_portal
+    #    (10r/m burst=10) sẽ chặn ngay từ lượt xem đầu tiên. Endpoint chỉ đọc
+    #    object bất biến theo id, không hé lộ gì về mã bảo hành nên nới lỏng
+    #    được. Prefix dài hơn nên nginx chọn location này trước location
+    #    chung bên dưới bất kể thứ tự khai báo trong file.
+    location /api/warranty-portal/product-images/ {
+        limit_req zone=desi_portal_media burst=30 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ── API portal public: zone riêng, chặt hơn /api/ chung vì không đăng nhập ──
+    location /api/warranty-portal/ {
+        limit_req zone=desi_portal burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ── Bundle SPA ──
+    location /assets/ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        expires 1y;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    location /bao-hanh {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Trang sản phẩm khi quét QR trên tem: https://delax.com.vn/sp/<mã>. Mã
+    # nằm trong path, frontend đọc client-side — không cần rewrite riêng.
+    location /sp/ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

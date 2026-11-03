@@ -1,0 +1,36 @@
+# Alertmanager config cho desi-order.
+# Mặc định gom alert và gửi tới một webhook receiver (placeholder). Cấu hình
+# receiver thật (Lark/Slack/email) bằng cách sửa `receivers` bên dưới.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: default
+      repeat_interval: 1h
+
+receivers:
+  - name: default
+    # Trỏ vào adapter, KHÔNG trỏ thẳng bot Lark. Alertmanager gửi payload theo
+    # schema riêng của nó ({"version":"4","alerts":[...]}), còn Lark custom bot
+    # chỉ nhận {"msg_type":"text","content":{...}} — gửi thẳng thì Lark từ chối
+    # và KHÔNG AI nhận được alert, hỏng hoàn toàn im lặng.
+    # Adapter: monitoring/lark_alert_adapter.py (service lark-alert-adapter).
+    # URL bot thật nằm ở env LARK_ALERT_WEBHOOK_URL của adapter — không commit.
+    # Env trống → adapter chạy NOOP, chỉ in alert ra log.
+    webhook_configs:
+      - url: "http://lark-alert-adapter:9095"
+        send_resolved: true
+
+inhibit_rules:
+  # Khi đã có alert critical cho cùng instance thì nén bớt warning trùng.
+  - source_matchers: [severity = "critical"]
+    target_matchers: [severity = "warning"]
+    equal: ["instance"]

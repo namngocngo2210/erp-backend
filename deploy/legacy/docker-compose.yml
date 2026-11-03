@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: public.ecr.aws/docker/library/postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-desi}
+      POSTGRES_USER: ${POSTGRES_USER:-desi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    ports:
+      # Chỉ bind localhost — Postgres dev không được lộ ra mọi interface.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./backup/desi_order.dump:/backup/desi_order.dump:ro
+      - ./backup/init-postgres-restore.sh:/docker-entrypoint-initdb.d/10-restore.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-desi} -d $${POSTGRES_DB:-desi}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: public.ecr.aws/docker/library/redis:7-alpine
+    # Mục này dùng để truyền vào code Backend nếu backend cũng chạy trong Docker
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    command: >
+      sh -c "
+      if [ ! -f /data/dump.rdb ] && [ -f /backup/redis_dump.rdb ]; then
+        cp /backup/redis_dump.rdb /data/dump.rdb
+      fi;
+      exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes --appendfsync everysec
+      "
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./backup/redis_dump.rdb:/backup/redis_dump.rdb:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  minio:
+    # Pin 2026-07-03: bản community cuối — MinIO đã ngừng publish image (repo archived).
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: desi-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  redis_data:
+  minio_data:

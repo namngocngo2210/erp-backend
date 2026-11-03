@@ -1,0 +1,301 @@
+# Unit test cho alert rules — chạy bằng:
+#   docker run --rm --entrypoint promtool -v "$PWD/monitoring:/rules" \
+#     prom/prometheus:v3.13.0 test rules /rules/alerts_test.yml
+#
+# Lý do tồn tại: `promtool check rules` chỉ kiểm CÚ PHÁP. Sự cố 2026-07-29 phơi ra
+# một lỗi mà nó không bắt được — hai rule connection so sánh
+# `sum(...) by (instance)` với `pg_settings_max_connections`, mà vế phải còn giữ
+# label `job`/`server`/`datname`. Vector matching mặc định đòi khớp TOÀN BỘ label
+# nên phép so sánh trả rỗng và alert im lặng vĩnh viễn — cú pháp vẫn hợp lệ hoàn
+# toàn. Chỉ có test với label lệch nhau như dưới đây mới lộ ra.
+#
+# Các series dưới cố ý mô phỏng đúng label thật của postgres-exporter: vế trái có
+# thêm `datname` + `state`, vế phải không có.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    name: "Cạn connection Postgres — alert phải bắn dù label hai vế lệch nhau"
+    input_series:
+      - series: 'pg_stat_activity_count{instance="postgres-exporter:9187",job="postgres-exporter",server="postgres:5432",datname="desi",state="idle"}'
+        values: "88+0x20"
+      - series: 'pg_stat_activity_count{instance="postgres-exporter:9187",job="postgres-exporter",server="postgres:5432",datname="desi",state="active"}'
+        values: "4+0x20"
+      - series: 'pg_settings_max_connections{instance="postgres-exporter:9187",job="postgres-exporter",server="postgres:5432"}'
+        values: "100+0x20"
+    alert_rule_test:
+      # 88 + 4 = 92 > 85 (85% của 100) → phải bắn sau `for: 1m`.
+      - eval_time: 5m
+        alertname: PostgresTooManyConnections
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: "postgres-exporter:9187"
+            exp_annotations:
+              summary: "Postgres gần cạn connection (>85% max)"
+              description: "Số kết nối đã vượt 85% max_connections > 1 phút — nguy cơ 'too many clients'. Bão ngắn thường là hàng loạt client reconnect cùng lúc; soi pg_stat_activity theo application_name."
+      # 92 > 50 → rule rò rỉ cũng phải bắn, sau `for: 15m`.
+      - eval_time: 17m
+        alertname: PostgresConnectionLeak
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: "postgres-exporter:9187"
+            exp_annotations:
+              summary: "Connection Postgres tăng bất thường (>50% max, 15 phút)"
+              description: "Nghi rò rỉ connection (backend mồ côi do OOM-kill, hoặc idle in transaction). Kiểm tra pg_stat_activity theo client_addr + state."
+
+  - interval: 1m
+    name: "Bão một mẫu scrape — spike alert phải bắn ngay, không chờ for"
+    input_series:
+      # Kịch bản 2026-07-31: nền 3 connection, vọt 99 đúng một mẫu rồi tự hồi.
+      # Rule `for: 1m` bỏ lỡ (test dưới xác nhận); rule `for: 0m` phải bắt được.
+      - series: 'pg_stat_activity_count{instance="postgres-exporter:9187",job="postgres-exporter",server="postgres:5432",datname="desi",state="idle"}'
+        values: "3 99 3 3 3 3"
+      - series: 'pg_settings_max_connections{instance="postgres-exporter:9187",job="postgres-exporter",server="postgres:5432"}'
+        values: "100+0x5"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: PostgresConnectionSpike
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: "postgres-exporter:9187"
+            exp_annotations:
+              summary: "Connection Postgres vọt >85% max trong một mẫu scrape"
+              description: "Bão connection ngắn (dưới 1 phút — kiểu 2026-07-31: 3→99 rồi tự hồi trong một mẫu 15s). Truy thủ phạm: PromQL `sum by (datname, usename, state) (pg_stat_activity_count)` tại đúng mốc bắn, hoặc Loki {container=\"desi-postgres\"} dòng 'connection authorized' quanh mốc đó."
+      # Rule 1m KHÔNG bắn với bão một mẫu — đó chính là lỗ hổng khiến 2026-07-31
+      # không có cảnh báo nào; giữ test này để ai hạ `for` xuống 0 phải sửa cả hai.
+      - eval_time: 1m
+        alertname: PostgresTooManyConnections
+        exp_alerts: []
+      # Đã hồi về nền → spike alert phải tự tắt.
+      - eval_time: 3m
+        alertname: PostgresConnectionSpike
+        exp_alerts: []
+
+  - interval: 1m
+    name: "Steady-state không được bắn cảnh báo giả"
+    input_series:
+      - series: 'pg_stat_activity_count{instance="postgres-exporter:9187",job="postgres-exporter",server="postgres:5432",datname="desi",state="idle"}'
+        values: "12+0x20"
+      - series: 'pg_settings_max_connections{instance="postgres-exporter:9187",job="postgres-exporter",server="postgres:5432"}'
+        values: "100+0x20"
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: PostgresTooManyConnections
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: PostgresConnectionLeak
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: PostgresConnectionSpike
+        exp_alerts: []
+
+  - interval: 1m
+    name: "Gate 503 — một request bị từ chối là phải bắn ngay"
+    input_series:
+      # Kịch bản 2026-08-03 13:46: counter nhảy 258 trong 2 phút rồi đứng yên.
+      - series: 'desi_http_gate_timeouts_total{path_prefix="/api/orders",instance="web:8000",job="desi-backend"}'
+        values: "0 0 180 258 258 258 258 258 258 258 258 258"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HttpGateTimeouts
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              path_prefix: "/api/orders"
+            exp_annotations:
+              summary: "Gate concurrency từ chối request (/api/orders)"
+              description: "258 request chờ quá WEB_HTTP_QUEUE_TIMEOUT rồi nhận 503 trong 5 phút. Slot đầy vì burst hoặc vì request giữ slot quá lâu — đối chiếu p95 desi_http_request_duration_seconds của route tương ứng."
+      # Counter đứng yên đủ lâu (increase 5m về 0) → alert tự tắt.
+      - eval_time: 11m
+        alertname: HttpGateTimeouts
+        exp_alerts: []
+
+  # ── ai_mart: rule "vắng thành công" phải chịu được deploy ────────────────────
+  # celery-exporter gắn label hostname (= container id) vào celery_task_*_total và
+  # PURGE toàn bộ series của worker 10' sau khi worker đó offline. Mỗi deploy đổi
+  # hostname → series cũ biến mất, series mới chỉ sinh khi task chạy lần tới.
+  # Với rebuild_all_marts (1 lượt/đêm) tức là `absent()` đúng suốt từ deploy tới
+  # sáng hôm sau — sự cố 2026-09-22 (báo giả dù ETL vẫn chạy). Rule phải đo
+  # "không có lượt thành công nào TRONG CỬA SỔ", không phải "hiện tại không có
+  # series".
+  - interval: 5m
+    name: "AiMartRebuildSilent — deploy sau rebuild không được báo giả, quá 26h mới báo"
+    input_series:
+      # Worker A: rebuild thành công lúc t=0 (0→1), online tới t=2h rồi bị purge.
+      - series: 'celery_task_succeeded_total{name="apps.ai_mart.tasks.rebuild_all_marts",hostname="aaaa",queue_name="celery",instance="celery-exporter:9808",job="celery-exporter"}'
+        values: "0 1+0x23"
+    alert_rule_test:
+      # 10h sau rebuild, worker mới chưa chạy lượt nào — series A đã purge. KHÔNG báo.
+      - eval_time: 10h
+        alertname: AiMartRebuildSilent
+        exp_alerts: []
+      # 30h không có lượt thành công nào → phải báo. Cửa sổ 26h trống hoàn toàn
+      # nên nổ qua nhánh absent_over_time — nhánh này giữ label `name` từ selector.
+      - eval_time: 30h
+        alertname: AiMartRebuildSilent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              name: "apps.ai_mart.tasks.rebuild_all_marts"
+            exp_annotations:
+              summary: "Rebuild đêm schema ai không chạy >26 giờ"
+              description: "san_pham/ton_kho/chi_phi_quang_cao KHÔNG có đường nạp tăng dần — rebuild đêm chết là 3 bảng đó đóng băng, và mất luôn cơ chế tự lành cho nhóm nóng."
+
+  - interval: 5m
+    name: "AiMartSyncSilent — đổi hostname worker giữa hai lượt sync không được báo giả"
+    input_series:
+      # Worker A: sync thành công t=0 và t=30m, offline sau t=40m (purge).
+      - series: 'celery_task_succeeded_total{name="apps.ai_mart.tasks.sync_hot_marts",hostname="aaaa",queue_name="celery",instance="celery-exporter:9808",job="celery-exporter"}'
+        values: "0 1 1 1 1 1 1 2 2 2"
+      # Worker B (sau deploy): lượt đầu thành công t=60m.
+      - series: 'celery_task_succeeded_total{name="apps.ai_mart.tasks.sync_hot_marts",hostname="bbbb",queue_name="celery",instance="celery-exporter:9808",job="celery-exporter"}'
+        values: "_x11 0 1+0x30"
+    alert_rule_test:
+      # t=50m: A đã purge, B chưa có lượt nào — nhưng 90' gần nhất vẫn có 2 lượt thành công.
+      - eval_time: 50m
+        alertname: AiMartSyncSilent
+        exp_alerts: []
+      # t=2h: B chạy được 1 lượt lúc 60m → vẫn im.
+      - eval_time: 2h
+        alertname: AiMartSyncSilent
+        exp_alerts: []
+      # t=3h: lượt thành công gần nhất là 60m, quá 90' → báo.
+      - eval_time: 3h
+        alertname: AiMartSyncSilent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "ETL schema ai không chạy >90 phút"
+              description: "Không có lượt sync_hot_marts thành công nào trong 90 phút (nhịp chuẩn 30'), hoặc metric vắng mặt hoàn toàn (worker-slow/beat chưa từng chạy task này). Kiểm beat + queue slow."
+
+  # Lượt chạy xong trong <1 scrape (extract khi AI_CHAT_EXTRACT_ENABLED=0 mất
+  # 5ms; sync đêm không có gì để nạp) sinh series thẳng ở giá trị 1 — Prometheus
+  # chưa từng thấy 0 nên increase()=0 cho tới lượt kế tiếp. `for:` phải phủ đủ
+  # một nhịp để không báo giả trong khoảng đó.
+  - interval: 1m
+    name: "AiChatExtractSilent — series sinh ở 1 sau deploy, nhịp 10' không được báo giả"
+    input_series:
+      - series: 'celery_task_succeeded_total{name="apps.ai_mart.tasks.extract_chat_labels",hostname="bbbb",queue_name="celery",instance="celery-exporter:9808",job="celery-exporter"}'
+        values: "1+0x9 2+0x9 3+0x200"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: AiChatExtractSilent
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: AiChatExtractSilent
+        exp_alerts: []
+      # Đứng ở 3 từ phút 20 → quá 3h + for → phải báo.
+      - eval_time: 3h40m
+        alertname: AiChatExtractSilent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Task gán nhãn chat không chạy được lượt nào >3 giờ (beat/worker slow chết)"
+              description: "Không có lượt extract_chat_labels THÀNH CÔNG nào trong 3 giờ (nhịp chuẩn 10', phút 3/13/23/33/43/53) — nghĩa là beat không phát task hoặc worker queue slow chết/kẹt. Kiểm beat schedule ai-mart-chat-extract và worker queue slow trước tiên. CẢNH BÁO PHẠM VI: rule này KHÔNG nổ khi AI_CHAT_EXTRACT_ENABLED=0, khi GEMINI_API_KEY rỗng, khi đang trong cooldown hết quota Gemini, hay khi mọi dòng trong lô đều lỗi — cả 4 ca đó task vẫn kết thúc THÀNH CÔNG mà không sinh nhãn nào. Nhãn đứng im mà rule này im lặng thì kiểm tay theo runbook 2026-09-04-ai-chat-mart-deploy.md mục 'Gán nhãn đứng im nhưng alert không kêu'."
+
+  - interval: 1m
+    name: "AiMartSyncSilent — series sinh ở 1 sau deploy, nhịp 30' không được báo giả"
+    input_series:
+      - series: 'celery_task_succeeded_total{name="apps.ai_mart.tasks.sync_hot_marts",hostname="bbbb",queue_name="celery",instance="celery-exporter:9808",job="celery-exporter"}'
+        values: "1+0x29 2+0x300"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AiMartSyncSilent
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: AiMartSyncSilent
+        exp_alerts: []
+
+  # ── HttpEndpointSlow / HttpEndpointVerySlow (sự cố 2026-09-23 11:09) ───────
+  # histogram_quantile nội suy trong bucket: 3 request rơi vào bucket 2.5–5s là đủ
+  # cho "p95 = 4.9s". Bốn kịch bản dưới khoá hành vi: sàn traffic và loại route proxy.
+  - interval: 1m
+    name: "HttpEndpointSlow — 3 request chậm không được bắn (dưới sàn 30/10 phút)"
+    input_series:
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?landing",method="POST",status="200",le="2.5"}'
+        values: "0+0x25"
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?landing",method="POST",status="200",le="5.0"}'
+        # Request ở phút 1, 5, 9: rate[10m] > 0 liên tục từ phút 1 tới ~18 → không có sàn
+        # thì alert đã firing từ phút 11 (test mutation 2026-09-23 xác nhận).
+        values: "0 1 1 1 1 2 2 2 2 3+0x16"
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?landing",method="POST",status="200",le="+Inf"}'
+        values: "0 1 1 1 1 2 2 2 2 3+0x16"
+      - series: 'desi_http_requests_total{route="^api/orders/?landing",method="POST",status="200"}'
+        values: "0 1 1 1 1 2 2 2 2 3+0x16"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HttpEndpointSlow
+        exp_alerts: []
+
+  - interval: 1m
+    name: "HttpEndpointSlow — 60 request/10 phút ở bucket 2.5–5s phải bắn"
+    input_series:
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?landing",method="POST",status="200",le="2.5"}'
+        values: "0+0x25"
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?landing",method="POST",status="200",le="5.0"}'
+        values: "0+6x25"
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?landing",method="POST",status="200",le="+Inf"}'
+        values: "0+6x25"
+      - series: 'desi_http_requests_total{route="^api/orders/?landing",method="POST",status="200"}'
+        values: "0+6x25"
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: HttpEndpointSlow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              route: "^api/orders/?landing"
+            exp_annotations:
+              summary: "Endpoint ^api/orders/?landing chậm (p95 > 2s)"
+              description: "p95 = 4.9s suốt 10 phút (>= 30 request). Route đọc DB: đối chiếu pg_stat_statements. Route gọi dịch vụ ngoài (KiotViet, ads-crm, Facebook): tra log theo request_id xem upstream mất bao lâu."
+
+  - interval: 1m
+    name: "Route proxy KShip — Slow không bắn dù nhiều request, VerySlow (>10s) vẫn bắn"
+    input_series:
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?kship-options",method="POST",status="200",le="10.0"}'
+        values: "0+0x25"
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?kship-options",method="POST",status="200",le="30.0"}'
+        values: "0+6x25"
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?kship-options",method="POST",status="200",le="+Inf"}'
+        values: "0+6x25"
+      - series: 'desi_http_requests_total{route="^api/orders/?kship-options",method="POST",status="200"}'
+        values: "0+6x25"
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: HttpEndpointSlow
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: HttpEndpointVerySlow
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              route: "^api/orders/?kship-options"
+            exp_annotations:
+              summary: "Endpoint ^api/orders/?kship-options rất chậm (p95 > 10s)"
+              description: "p95 = 29.0s (>= 5 request). Gần chạm statement_timeout — người dùng đang thấy treo."
+
+  - interval: 1m
+    name: "HttpEndpointVerySlow — 1 request lẻ ở bucket 10–30s không được bắn critical"
+    input_series:
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?reports/ads",method="GET",status="200",le="10.0"}'
+        values: "0+0x25"
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?reports/ads",method="GET",status="200",le="30.0"}'
+        values: "0 0 1+0x23"
+      - series: 'desi_http_request_duration_seconds_bucket{route="^api/orders/?reports/ads",method="GET",status="200",le="+Inf"}'
+        values: "0 0 1+0x23"
+      - series: 'desi_http_requests_total{route="^api/orders/?reports/ads",method="GET",status="200"}'
+        values: "0 0 1+0x23"
+    alert_rule_test:
+      # Phút 9: request ở phút 2 vẫn trong cửa sổ rate[10m], điều kiện >10s đã đúng >5 phút.
+      - eval_time: 9m
+        alertname: HttpEndpointVerySlow
+        exp_alerts: []

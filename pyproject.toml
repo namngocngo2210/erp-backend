@@ -1,0 +1,122 @@
+[project]
+name = "desi-order-backend"
+version = "0.1.0"
+requires-python = ">=3.13"
+
+# Dependencies là nguồn chân lý ở requirements.txt (image prod build từ đó).
+# Khối này chỉ để `uv sync` không rơi về fallback — KHÔNG liệt kê lại package.
+[tool.ruff]
+# 6243 dòng vượt 88 ký tự mặc định; ở 120 còn 664. Đặt 120 để phản ánh phong cách
+# thực tế của codebase, nhưng E501 vẫn nằm trong ignore bên dưới cho tới khi trả xong nợ.
+line-length = 120
+target-version = "py313"
+extend-exclude = ["*/migrations/*"]
+
+[tool.ruff.lint]
+# Trước audit 2026-07-23, CI chỉ chạy `--select E9,F63,F7,F82` (4 nhóm: syntax +
+# undefined name). Ruleset dưới đây mở rộng sang các rule BẮT LỖI THẬT:
+#   B    bugbear      — bẫy runtime (mutable default, except không `from`, loop var)
+#   DTZ  datetimez    — datetime naive: nguồn bug lệch múi giờ kinh điển ở hệ thống
+#                       báo cáo theo ngày như đơn hàng/chấm công
+#   LOG  logging      — dùng logger sai cách
+#   RET/SIM/C4/PIE    — đơn giản hoá, giảm nhánh chết
+#   T20  print        — print() lọt vào code prod
+#   UP   pyupgrade    — cú pháp cũ so với target py313
+select = ["E4", "E7", "E9", "F", "B", "C4", "DTZ", "LOG", "PIE", "RET", "SIM", "T20", "UP"]
+
+# ── Nợ HIỆN HỮU (đo 2026-07-23: 405; đo lại 2026-09-23 sau sweep: 544 trên rule dưới đây) ──
+# Cùng triết lý với `.importlinter`: CHẶN NỢ MỚI ngay hôm nay, trả nợ cũ dần bằng
+# cách xoá từng dòng khỏi danh sách này. Mọi rule KHÔNG có tên ở đây đã sạch và
+# sẽ chặn CI ngay khi có vi phạm mới. Số vi phạm từng rule còn được ratchet ở
+# scripts/arch-baseline.json (test apps/common/tests/test_arch_ratchet.py): tăng là fail.
+#
+# KHÔNG chạy `ruff check --fix` hàng loạt để dọn nhanh: ~20 nhánh đang mở sẽ
+# conflict, và F401 trong các module facade (re-export tường minh có noqa) là
+# re-export cố ý — "fix" sẽ xoá đúng thứ đang được import ở nơi khác.
+# Sweep 2026-09-23 (audit C3/P1-4): --fix an toàn cho UP017/UP037/UP006/UP045/F541/
+# C420/UP035/C416/UP012/UP034/UP031 + B008/E401 (đã 0 từ lâu) → 13 rule rời ignore.
+#
+# F403/F405 ĐÃ TRẢ XONG (2026-08-20, audit 4.5+5.2): chuỗi star-import kiotviet
+# services / orders serializers / order tasks / address đã đổi sang import tường
+# minh. Facade nào còn `import *` cố ý (audit/middleware, channels_core, exports)
+# đều mang noqa inline. KHÔNG thêm star-import mới. (`orders/services` facade xoá 2026-09-23.)
+ignore = [
+    # Nợ cần trả dần, kèm số vi phạm lúc đo (2026-09-23):
+    "E501",  # 408 (ở line-length=120) — dòng quá dài. Rule này KHÔNG nằm trong `select`
+             #     (E4/E7/E9 không gồm E5) nên dòng ignore chỉ là ghi nhớ số nợ; khi trả
+             #     xong thì thêm "E5" vào select và xoá dòng này.
+    "F401",  # 186 — import không dùng (cẩn thận re-export, xem ghi chú trên)
+    "SIM117",# 101 — with lồng nhau
+    "C408",  #  29 — dict()/list() thay vì literal
+    "B905",  #  26 — zip() thiếu strict=
+    "T201",  #  21 — print() còn sót
+    "SIM108",#  20 — if/else thay vì biểu thức điều kiện
+    "E701",  #  19 — nhiều lệnh trên một dòng
+    "DTZ007",#  18 — strptime không timezone
+    "DTZ001",#  16 — datetime() không tzinfo
+    "E402",  #  14 — import không ở đầu file (settings base.py: 3 import phải sau load_dotenv)
+    "RET504",#  10 — gán rồi return ngay
+    "DTZ011",#   9 — date.today()
+    "E741",  #   8 — tên biến mơ hồ (l/I/O)
+    "F841",  #   6 — biến không dùng
+    "SIM105",#   6 — nên dùng contextlib.suppress
+    "F601",  #   5 — key lặp trong dict literal
+    "SIM102",#   5 — if lồng gộp được
+    "UP042", #   5 — nên kế thừa StrEnum
+    "RET505",#   4 — else thừa sau return
+    "SIM103",#   4 — return bool trực tiếp
+    "B007", "B017", "B023", "B904", "SIM114", "SIM115", "SIM910",  # 3 mỗi rule
+    "DTZ005", "SIM113",  # 2 mỗi rule
+    "B018", "DTZ901", "LOG004", "PIE790", "PIE810", "SIM212",  # 1 mỗi rule
+    "UP046",  #  1 — generic class chưa dùng cú pháp PEP 695
+]
+
+[tool.mypy]
+# ── Type check GIỚI HẠN PHẠM VI (audit 2026-08-19, mục 5.1) ────────────────────
+# Type hint phủ ~68% codebase nhưng không có checker → hint chỉ là tài liệu.
+# Cùng triết lý "chặn nợ mới" của ruff/import-linter: bật mypy CHỈ cho vùng đã
+# type đầy đủ (contracts của các app + apps/common), mở rộng dần bằng cách thêm
+# đường dẫn vào `files`.
+#
+# KHÔNG dùng plugin django-stubs: plugin đòi DJANGO_SETTINGS_MODULE và import
+# settings thật lúc chạy mypy → kéo toàn bộ app dependencies (celery, channels,
+# boto3...) vào job typecheck và phá phạm vi hẹp. Trade-off: thiếu type cho
+# QuerySet/Manager suy ra từ model — chấp nhận được vì contracts/common không
+# định nghĩa model; django-stubs vẫn được cài để mypy có stub cho django.* thuần
+# (stub LUÔN được follow, bất kể follow_imports — follow_imports_for_stubs=false
+# là mặc định). Khi mở rộng sang vùng model/queryset thì cân nhắc lại plugin.
+python_version = "3.13"
+files = [
+    "apps/common",
+    "apps/best_express/contracts",
+    "apps/channels_core/contracts.py",
+    "apps/cnv_loyalty/contracts",
+    "apps/foxia/contracts",
+    "apps/hr/contracts",
+    "apps/inventory/contracts",
+    "apps/orders/contracts",
+]
+# skip: import ra NGOÀI danh sách `files` (apps/orders/models, ...) thành Any —
+# không kéo cả codebase vào phân tích. Import giữa các module TRONG `files`
+# vẫn được type thật (đều nằm trong build).
+follow_imports = "skip"
+# Package không có stub (celery, redis, ...) thành Any thay vì lỗi thiếu stub.
+ignore_missing_imports = true
+# Vùng này đã type kỹ — mọi def mới phải có annotation đầy đủ.
+disallow_untyped_defs = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+# Nợ hiện hữu (đo 2026-08-19): 62 def trong apps/common chưa annotate đủ —
+# contracts thì sạch nên giữ disallow_untyped_defs cho contracts, còn apps/common
+# tạm nới; body vẫn được check nhờ check_untyped_defs. Trả nợ xong thì xoá override.
+module = ["apps.common", "apps.common.*"]
+disallow_untyped_defs = false
+
+[tool.ruff.lint.per-file-ignores]
+# Test được phép dùng assert trần, fixture shadow tên, và import phục vụ side-effect.
+"**/tests/**" = ["B011", "F811"]
+# settings dùng `from .x import *` để ghép các phần cấu hình.
+"config/settings*.py" = ["F403", "F405"]
