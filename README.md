@@ -1,11 +1,11 @@
-# orderdesk-api
+# erp-api
 
 Django + DRF + Channels backend (HTTP API and WebSocket) for the order management system.
 Split out of the former single repo `desi-order` (this repo = old `backend/` + shared docs/scripts).
 
 Related repos:
-- `orderdesk-web`: React frontend, talks to this API.
-- `orderdesk-worker`: Celery workers + beat; runs THIS code (tasks live in `apps/*/tasks.py`), pinned as a git submodule.
+- `erp-web`: React frontend, talks to this API.
+- `erp-worker`: Celery workers + beat; runs THIS code (tasks live in `apps/*/tasks.py`), pinned as a git submodule.
 
 ## Run locally
 ```bash
